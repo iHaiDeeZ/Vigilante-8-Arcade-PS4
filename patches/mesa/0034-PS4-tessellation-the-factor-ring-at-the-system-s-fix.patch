@@ -1,0 +1,205 @@
+From 4f1149aa21847922ccad9ce0118e3130a56b1d35 Mon Sep 17 00:00:00 2001
+From: ps4-kit <ps4-kit@localhost>
+Date: Tue, 24 Nov 2026 17:47:57 +0300
+Subject: [PATCH 34/34] PS4: tessellation - the factor ring at the system's
+ fixed address 0xFF0000000 (the PS4 ignores an app's VGT_TF_MEMORY_BASE: the
+ first tessellated draw read 0xff0000000 and the system ended the app,
+ vig8-ps4 v00.03), and the offchip ring the PS4's 8 MiB
+
+---
+ src/amd/common/ac_gpu_info.c |  9 +++++
+ src/amd/common/ac_ps4_drm.c  | 73 ++++++++++++++++++++++++++++++++++++
+ src/amd/vulkan/radv_queue.c  | 36 ++++++++++++++++--
+ 3 files changed, 114 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index b5d7487..965a623 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -1635,6 +1635,15 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
+    info->tess_factor_ring_size = typical_tess_factor_size_per_wg * num_tess_factor_wg_per_cu *
+                                  info->max_good_cu_per_sa * info->max_sa_per_se * info->max_se;
+    info->total_tess_ring_size = info->tess_offchip_ring_size + info->tess_factor_ring_size;
++#ifdef __PS4__
++   /* The PS4's offchip tessellation buffer as the system programs VGT_HS_OFFCHIP_PARAM (an app's
++    * write is ignored, like the factor ring's registers: ac_ps4_drm.c): 8 MiB
++    * (sceGnmGetOffChipTessellationBufferSize). The hull and domain shaders' offchip offsets come
++    * from the hardware, so RADV's offchip ring covers all of it - with RADV's 2.25 MiB, accesses
++    * past it would be dropped by the descriptor and those patches lost. */
++   info->tess_offchip_ring_size = MAX2(info->tess_offchip_ring_size, 8u << 20);
++   info->total_tess_ring_size = info->tess_offchip_ring_size + info->tess_factor_ring_size;
++#endif
+ 
+    if (info->gfx_level >= GFX12)
+       info->rt_ip_version = RT_3_1;
+diff --git a/src/amd/common/ac_ps4_drm.c b/src/amd/common/ac_ps4_drm.c
+index fdf0924..bad9a36 100644
+--- a/src/amd/common/ac_ps4_drm.c
++++ b/src/amd/common/ac_ps4_drm.c
+@@ -1080,6 +1080,78 @@ ps4_install_fault_capture(ac_drm_device *dev, int gnm_module)
+            rr, re, ps4_stop_info_cpu ? "cpu" : "-", ps4_stop_info_gpu ? "gpu" : "-");
+ }
+ 
++/* The tessellation factor ring. On the PS4 the system programs VGT_TF_MEMORY_BASE,
++ * VGT_TF_RING_SIZE and VGT_HS_OFFCHIP_PARAM: an app's writes to them (RADV's preamble) are ignored,
++ * like VGT_ESGS/GSVS_RING_SIZE (radv_queue.c, ac_ps4_gs_ring_min). The factor ring is at a fixed
++ * address - the one libSceGnmDriver's sceGnmGetTheTessellationFactorRingBufferBaseAddress returns,
++ * 0xFF0000000 (shadPS4: the system-reserved range's end - 256 MiB) - where the app maps memory of
++ * its own: the hull shaders write the tess factors there and the tessellator reads them. Without
++ * it the first tessellated draw ends the app: "GPU Protection fault. vmid: game process, client:
++ * TC0, access: Read, reason: Unmapped page access, addr(VA): 0x0000000ff0000000" (vig8-ps4 v00.03,
++ * its first gameplay frame; RADV's preamble had pointed VGT_TF_MEMORY_BASE at its own buffer).
++ * Mapped once here; RADV's factor-ring descriptor points at it (ac_ps4_tess_factor_ring). 256 KiB:
++ * VGT_TF_RING_SIZE counts 16 bits of dwords, so the system's ring cannot be larger. */
++#define PS4_TF_RING_VA 0xff0000000ull
++#define PS4_TF_RING_SIZE 0x40000ull
++static uint64_t ps4_tf_ring_va;
++
++static void
++ps4_map_tess_factor_ring(void)
++{
++   if (ps4_tf_ring_va)
++      return;
++   struct ps4_vq_info vq;
++   memset(&vq, 0, sizeof(vq));
++   /* flags 1 = find next: the first mapping at or after the ring's address */
++   if (!sceKernelVirtualQuery((void *)(uintptr_t)PS4_TF_RING_VA, 1, &vq, sizeof(vq)) &&
++       (uint64_t)(uintptr_t)vq.start < PS4_TF_RING_VA + PS4_TF_RING_SIZE &&
++       (uint64_t)(uintptr_t)vq.end > PS4_TF_RING_VA) {
++      ps4_log("radv/ps4: tessellation factor ring: %p..%p already mapped ('%.32s'), not mapped\n",
++              vq.start, vq.end, vq.name);
++      return;
++   }
++   off_t phys;
++   int r = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), PS4_TF_RING_SIZE,
++                                         0x10000, PS4_WC_GARLIC, &phys);
++   if (r) {
++      ps4_log("radv/ps4: tessellation factor ring: no direct memory (%#x)\n", r);
++      return;
++   }
++   void *addr = (void *)(uintptr_t)PS4_TF_RING_VA;
++   r = sceKernelMapDirectMemory(&addr, PS4_TF_RING_SIZE, PS4_PROT_CPU_RW | PS4_PROT_GPU_RW,
++                                PS4_MAP_FIXED, phys, 0x10000);
++   if (r) {
++      /* the way the SDK's samples map it: the address as a hint */
++      ps4_log("radv/ps4: tessellation factor ring: fixed mapping refused (%#x), trying the hint\n", r);
++      addr = (void *)(uintptr_t)PS4_TF_RING_VA;
++      r = sceKernelMapDirectMemory(&addr, PS4_TF_RING_SIZE, PS4_PROT_CPU_RW | PS4_PROT_GPU_RW, 0, phys,
++                                   0x10000);
++   }
++   if (r || addr != (void *)(uintptr_t)PS4_TF_RING_VA) {
++      ps4_log("radv/ps4: tessellation factor ring: mapping at %#llx failed (%#x, %p)\n",
++              PS4_TF_RING_VA, r, addr);
++      if (!r)
++         sceKernelMunmap(addr, PS4_TF_RING_SIZE);
++      sceKernelReleaseDirectMemory(phys, PS4_TF_RING_SIZE);
++      return;
++   }
++   memset(addr, 0, PS4_TF_RING_SIZE);
++   ps4_tf_ring_va = PS4_TF_RING_VA;
++   ps4_log("radv/ps4: tessellation factor ring mapped at %#llx (%llu KiB, the system's fixed address)\n",
++           PS4_TF_RING_VA, PS4_TF_RING_SIZE >> 10);
++}
++
++bool ac_ps4_tess_factor_ring(uint64_t *va, uint32_t *size);
++bool
++ac_ps4_tess_factor_ring(uint64_t *va, uint32_t *size)
++{
++   if (!ps4_tf_ring_va)
++      return false;
++   *va = ps4_tf_ring_va;
++   *size = (uint32_t)PS4_TF_RING_SIZE;
++   return true;
++}
++
+ static void *
+ ps4_map_new(size_t size, int type, int prot, off_t *phys_out)
+ {
+@@ -1236,6 +1308,7 @@ ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32
+       ps4_install_fault_capture(dev, dev->gnm_module);
+    ps4_fault_dev = dev; /* the last device created is the one in use */
+    ps4_start_flight_recorder(dev);
++   ps4_map_tess_factor_ring();
+    ps4_log("radv/ps4: device initialized\n");
+    return 0;
+ 
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index 0661c6a..faabf93 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -49,6 +49,9 @@ void ac_ps4_trace(const char *fmt, ...);
+  * descriptor's bounds - as zeros - and those primitives vanish (Super Mario Maker's tiles, a
+  * different set every frame). Crema setting GS Ring Size. */
+ int ac_ps4_gs_ring_min = 8u << 20;
++/* The system's fixed tessellation factor ring, mapped by the winsys (ac_ps4_drm.c): false if it
++ * could not be mapped (then RADV's own buffer, as on Linux - and the tessellator reads elsewhere). */
++bool ac_ps4_tess_factor_ring(uint64_t *va, uint32_t *size);
+ #else
+ #define PS4_FAIL(label) goto label
+ #define PS4_RING_ALLOC(size) (size)
+@@ -242,12 +245,11 @@ radv_queue_submit_empty(struct radv_queue *queue, struct vk_queue_submit *submis
+ }
+ 
+ static void
+-radv_set_ring_buffer(const struct radv_physical_device *pdev, struct radeon_winsys_bo *bo, uint32_t offset,
+-                     uint32_t ring_size, bool add_tid, bool swizzle_enable, bool oob_select_raw, uint32_t element_size,
+-                     uint32_t index_stride, uint32_t desc[4])
++radv_set_ring_buffer_va(const struct radv_physical_device *pdev, uint64_t va, uint32_t ring_size, bool add_tid,
++                        bool swizzle_enable, bool oob_select_raw, uint32_t element_size, uint32_t index_stride,
++                        uint32_t desc[4])
+ {
+    const uint8_t oob_select = oob_select_raw ? V_008F0C_OOB_SELECT_RAW : V_008F0C_OOB_SELECT_DISABLED;
+-   const uint64_t va = radv_buffer_get_va(bo) + offset;
+    const struct ac_buffer_state ac_state = {
+       .va = va,
+       .size = ring_size,
+@@ -269,6 +271,15 @@ radv_set_ring_buffer(const struct radv_physical_device *pdev, struct radeon_wins
+    ac_build_buffer_descriptor(pdev->info.gfx_level, &ac_state, desc);
+ }
+ 
++static void
++radv_set_ring_buffer(const struct radv_physical_device *pdev, struct radeon_winsys_bo *bo, uint32_t offset,
++                     uint32_t ring_size, bool add_tid, bool swizzle_enable, bool oob_select_raw, uint32_t element_size,
++                     uint32_t index_stride, uint32_t desc[4])
++{
++   radv_set_ring_buffer_va(pdev, radv_buffer_get_va(bo) + offset, ring_size, add_tid, swizzle_enable, oob_select_raw,
++                           element_size, index_stride, desc);
++}
++
+ static void
+ radv_fill_shader_rings(struct radv_device *device, uint32_t *desc, struct radeon_winsys_bo *scratch_bo,
+                        uint32_t esgs_ring_size, struct radeon_winsys_bo *esgs_ring_bo, uint32_t gsvs_ring_size,
+@@ -321,6 +332,13 @@ radv_fill_shader_rings(struct radv_device *device, uint32_t *desc, struct radeon
+    desc += 8;
+ 
+    if (tess_rings_bo) {
++#ifdef __PS4__
++      uint64_t ps4_tf_va;
++      uint32_t ps4_tf_size;
++      if (ac_ps4_tess_factor_ring(&ps4_tf_va, &ps4_tf_size))
++         radv_set_ring_buffer_va(pdev, ps4_tf_va, ps4_tf_size, false, false, true, 0, 0, &desc[0]);
++      else
++#endif
+       radv_set_ring_buffer(pdev, tess_rings_bo, pdev->info.tess_offchip_ring_size, pdev->info.tess_factor_ring_size,
+                            false, false, true, 0, 0, &desc[0]);
+ 
+@@ -450,6 +468,16 @@ radv_emit_tess_factor_ring(struct radv_device *device, struct radv_cmd_stream *c
+ 
+    radv_cs_add_buffer(device->ws, cs->b, tess_rings_bo);
+ 
++#ifdef __PS4__
++   /* The system's factor ring (ac_ps4_tess_factor_ring): the PS4 ignores these register writes, but
++    * let them name the memory the tessellator really reads (ac_emit_cp_tess_rings adds the offchip
++    * ring's size to get the factor ring's address). */
++   uint64_t ps4_tf_va;
++   uint32_t ps4_tf_size;
++   if (ac_ps4_tess_factor_ring(&ps4_tf_va, &ps4_tf_size))
++      va = ps4_tf_va - pdev->info.tess_offchip_ring_size;
++#endif
++
+    ac_emit_cp_tess_rings(cs->b, &pdev->info, va);
+ }
+ 
+-- 
+2.53.0
+

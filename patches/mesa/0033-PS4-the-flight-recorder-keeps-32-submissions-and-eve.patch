@@ -1,0 +1,152 @@
+From 800a280280c6bb7b711af450c6641e1aebfb146b Mon Sep 17 00:00:00 2001
+From: ps4-kit <ps4-kit@localhost>
+Date: Tue, 24 Nov 2026 17:25:25 +0300
+Subject: [PATCH 33/34] PS4: the flight recorder keeps 32 submissions, and
+ every shader's code once in flight/code.bin (vig8-ps4 v00.02 queued 10
+ submissions behind the stuck one and the ring of 8 overwrote it; the shader a
+ fault came from can now be disassembled)
+
+---
+ src/amd/common/ac_ps4_drm.c | 68 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 63 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/common/ac_ps4_drm.c b/src/amd/common/ac_ps4_drm.c
+index 18ce9a6..fdf0924 100644
+--- a/src/amd/common/ac_ps4_drm.c
++++ b/src/amd/common/ac_ps4_drm.c
+@@ -729,7 +729,9 @@ ps4_find_symbol(const char *name)
+  * retail PS4 - the app is just gone, and its core dump is encrypted - but data written with
+  * write() sits in the kernel's page cache and survives the kill. So:
+  *  - /data/Crema/gpu/flight/ib-N.bin: the complete command stream of each submission (every IB,
+- *    chained and nested), in a ring of 8 files (N = submission % 8);
++ *    chained and nested), in a ring of PS4_FLIGHT_SLOTS files (N = submission % 32: the app keeps
++ *    submitting while the GPU is stuck, and with 8 the stuck submission was overwritten - vig8-ps4
++ *    v00.02 queued 10 more behind it);
+  *  - /data/Crema/gpu/flight/progress.log: submissions, the GPU's completed submission, and the
+  *    last RADV trace id (written by the CP as it reaches each draw), every millisecond it changes.
+  * After a kill, the last trace id locates the draw the GPU died on inside the saved stream.
+@@ -737,6 +739,7 @@ ps4_find_symbol(const char *name)
+ #include <sys/stat.h>
+ static volatile const uint32_t *ps4_trace_id;
+ static int ps4_progress_fd = -1;
++#define PS4_FLIGHT_SLOTS 32
+ 
+ void ac_ps4_set_trace_va(uint64_t va);
+ void
+@@ -845,13 +848,25 @@ ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_
+ /* The memory the submission's shader user data point to (descriptor sets, push constants, vertex
+  * buffer tables), and the 32-bit pointers inside that, one level more: mem-N.bin, records of
+  * 'DMEM' va length + bytes, to find offline what a draw reaches through descriptors (Donkey Kong
+- * Country: Tropical Freeze: a GPU write into a freed 720p image no command referred to). */
++ * Country: Tropical Freeze: a GPU write into a freed 720p image no command referred to).
++ * And the code of every shader the app runs (SPI_SHADER_PGM_LO_* / COMPUTE_PGM_LO), its first
++ * 4 KiB, once - again when its address holds other code: flight/code.bin, the same records (the
++ * last one for an address wins), to disassemble the shader a fault came from. */
+ struct ps4_mem_record {
+    uint32_t magic;
+    uint32_t length;
+    uint64_t va;
+ };
+ 
++static uint64_t ps4_code_va[512];
++static unsigned ps4_code_count;
++static int ps4_code_fd = -1;
++static struct {
++   uint64_t va;
++   uint64_t sig[2];
++} ps4_code_seen[4096];
++static unsigned ps4_code_seen_count;
++
+ static void
+ ps4_collect_user_data(uint32_t *ib, unsigned num_dw, uint32_t *values, unsigned *count, unsigned max,
+                       int depth)
+@@ -876,6 +891,13 @@ ps4_collect_user_data(uint32_t *ib, unsigned num_dw, uint32_t *values, unsigned
+          uint32_t *b = &ib[i + 1];
+          if (op == 0x76) { /* SET_SH_REG: values in pairs (a 64-bit address) and alone */
+             for (unsigned k = 1; k < body && *count + 2 <= max; k++) {
++               /* SPI_SHADER_PGM_LO_{PS,VS,GS,ES,HS,LS} and COMPUTE_PGM_LO (register offsets from
++                * 0xB000 in dwords): a shader's code address >> 8 */
++               const unsigned reg = (b[0] & 0xffff) + k - 1;
++               if ((reg == 0x8 || reg == 0x48 || reg == 0x88 || reg == 0xc8 || reg == 0x108 ||
++                    reg == 0x148 || reg == 0x20c) &&
++                   ps4_code_count < ARRAY_SIZE(ps4_code_va))
++                  ps4_code_va[ps4_code_count++] = (uint64_t)b[k] << 8;
+                values[(*count)++] = b[k];
+                values[(*count)++] = k + 1 < body ? b[k + 1] : 0;
+             }
+@@ -910,10 +932,11 @@ ps4_record_descriptors(void *const *dcb, const uint32_t *dcb_sizes, unsigned num
+       return;
+    static uint32_t values[8192];
+    unsigned count = 0;
++   ps4_code_count = 0;
+    for (unsigned i = 0; i < num_ibs; i++)
+       ps4_collect_user_data(dcb[i], dcb_sizes[i] / 4, values, &count, ARRAY_SIZE(values), 0);
+    char path[64];
+-   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/mem-%u.bin", (unsigned)(seq % 8));
++   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/mem-%u.bin", (unsigned)(seq % PS4_FLIGHT_SLOTS));
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+       return;
+@@ -954,6 +977,41 @@ ps4_record_descriptors(void *const *dcb, const uint32_t *dcb_sizes, unsigned num
+                queue[queued++] = dev->va32_start + d[j];
+       }
+    }
++   /* the shaders' code, to code.bin: each address once, again when its first 16 bytes change */
++   for (unsigned c = 0; c < ps4_code_count; c++) {
++      const uint64_t ptr = ps4_code_va[c];
++      if (ptr < 0x4000000000ull || ptr >= PS4_GPU_VA_LIMIT)
++         continue;
++      struct amdgpu_bo *t = ps4_bo_at(dev, ptr);
++      if (!t)
++         continue;
++      const uint32_t length = (uint32_t)MIN2(t->last_va + t->size - ptr, 4096);
++      if (length < 16)
++         continue;
++      uint64_t sig[2];
++      memcpy(sig, (const void *)(uintptr_t)ptr, sizeof(sig));
++      unsigned n = 0;
++      while (n < ps4_code_seen_count && ps4_code_seen[n].va != ptr)
++         n++;
++      if (n < ps4_code_seen_count && ps4_code_seen[n].sig[0] == sig[0] &&
++          ps4_code_seen[n].sig[1] == sig[1])
++         continue;
++      if (n == ps4_code_seen_count) {
++         if (ps4_code_seen_count == ARRAY_SIZE(ps4_code_seen))
++            continue;
++         ps4_code_seen_count++;
++      }
++      ps4_code_seen[n].va = ptr;
++      ps4_code_seen[n].sig[0] = sig[0];
++      ps4_code_seen[n].sig[1] = sig[1];
++      if (ps4_code_fd < 0)
++         ps4_code_fd = open("/data/Crema/gpu/flight/code.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
++      if (ps4_code_fd < 0)
++         break;
++      const struct ps4_mem_record r = {0x4d454d44, length, ptr};
++      write(ps4_code_fd, &r, sizeof(r));
++      write(ps4_code_fd, (const void *)(uintptr_t)ptr, length);
++   }
+    simple_mtx_unlock(&dev->lock);
+    close(fd);
+ }
+@@ -964,7 +1022,7 @@ ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_
+    if (ps4_progress_fd < 0)
+       return;
+    char path[64];
+-   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/ib-%u.bin", (unsigned)(seq % 8));
++   snprintf(path, sizeof(path), "/data/Crema/gpu/flight/ib-%u.bin", (unsigned)(seq % PS4_FLIGHT_SLOTS));
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+       return;
+@@ -972,7 +1030,7 @@ ps4_record_submission(void *const *dcb, const uint32_t *dcb_sizes, unsigned num_
+       ps4_record_ib(fd, dcb[i], dcb_sizes[i] / 4, seq, i, 0);
+    close(fd);
+    ps4_record_descriptors(dcb, dcb_sizes, num_ibs, seq);
+-   ps4_progress("submit %llu -> ib-%u.bin\n", (unsigned long long)seq, (unsigned)(seq % 8));
++   ps4_progress("submit %llu -> ib-%u.bin\n", (unsigned long long)seq, (unsigned)(seq % PS4_FLIGHT_SLOTS));
+ }
+ 
+ static void
+-- 
+2.53.0
+

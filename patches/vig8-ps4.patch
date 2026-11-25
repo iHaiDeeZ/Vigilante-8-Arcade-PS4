@@ -1,0 +1,4208 @@
+diff --git a/project/ps4/CMakeLists.txt b/project/ps4/CMakeLists.txt
+new file mode 100644
+index 0000000..a03ff74
+--- /dev/null
++++ b/project/ps4/CMakeLists.txt
+@@ -0,0 +1,113 @@
++# vig8-ps4 - Vigilante 8 Arcade (Xbox 360 XBLA, 584108A8) on the PS4 (ps4-kit: clang 21, OpenOrbis, x86-64 Jaguar).
++#
++# The MGR/MP3 ports' way (iHaiDeeZ/MGR-PS4, iHaiDeeZ/MP3-PS4): the game's PowerPC code recompiled to C++ by ReXGlue
++# v0.10.0's code generator and built for x86-64, the runtime being MP3's PS4 SDK (rexglue-sdk-nx + the PS4 layer), the
++# game's command ring drawn by the SDK's own Xenos emulation on its Vulkan back end, on ps4-kit's statically linked
++# RADV. One eboot.
++#
++# Configure (the port's scripts/build-vig8.sh app does it):
++#   ps4_cmake -S project/ps4 -B <build> -G Ninja -DCMAKE_BUILD_TYPE=Release \
++#     -DCMAKE_PROJECT_vig8_INCLUDE=$PS4_KIT/ps4-kit.cmake -DPS4_KIT_NETFS=OFF \
++#     -DREXSDK_DIR=<the PS4 SDK> -DVIG8_CODEGEN_DIR=<codegen output> -DREXGLUE_PLATFORM_PS4=ON -DREXGLUE_USE_VULKAN=ON
++
++cmake_minimum_required(VERSION 3.25)
++project(vig8 LANGUAGES C CXX)
++
++set(CMAKE_CXX_STANDARD 23)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++
++if(NOT REXGLUE_PLATFORM_PS4)
++    message(FATAL_ERROR "project/ps4: the PS4 build (-DREXGLUE_PLATFORM_PS4=ON, ps4-kit's toolchain)")
++endif()
++
++get_filename_component(VIG8_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
++
++set(VIG8_CODEGEN_DIR "" CACHE PATH "The codegen's output folder (holds generated/default/)")
++set(VIG8_GENERATED "${VIG8_CODEGEN_DIR}/generated/default")
++if(NOT EXISTS "${VIG8_GENERATED}/sources.cmake")
++    message(FATAL_ERROR
++        "VIG8_CODEGEN_DIR must point at the codegen's output "
++        "(no generated/default/sources.cmake under '${VIG8_CODEGEN_DIR}')")
++endif()
++
++set(REXSDK_DIR "" CACHE PATH "Path to the PS4 SDK (rexglue-sdk-nx + the PS4 layer)")
++if(NOT REXSDK_DIR)
++    message(FATAL_ERROR "REXSDK_DIR: the PS4 SDK's source tree")
++endif()
++add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
++message(STATUS "vig8: ReXGlue SDK from ${REXSDK_DIR}")
++
++# The mirror of the generated tree with the PS4 PCH (tools/make_ps4_pch.py).
++find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
++set(VIG8_TREE "${CMAKE_BINARY_DIR}/generated_ps4")
++execute_process(
++    COMMAND "${Python3_EXECUTABLE}" -I "${VIG8_DIR}/tools/prepare_tree.py"
++            "${VIG8_GENERATED}" "${VIG8_TREE}" "${VIG8_DIR}/tools/make_ps4_pch.py" vig8_pch.h
++    RESULT_VARIABLE _vig8_tree_rc)
++if(NOT _vig8_tree_rc EQUAL 0)
++    message(FATAL_ERROR "vig8: tools/prepare_tree.py failed (${_vig8_tree_rc})")
++endif()
++set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
++    "${VIG8_GENERATED}/vig8_pch.h"
++    "${VIG8_GENERATED}/sources.cmake"
++    "${VIG8_DIR}/tools/make_ps4_pch.py"
++    "${VIG8_DIR}/tools/prepare_tree.py")
++
++# generated/default/sources.cmake: the support units and the recompiled ones. CMAKE_CURRENT_LIST_DIR there is the mirror.
++include("${VIG8_TREE}/sources.cmake")
++set(VIG8_GUEST_SOURCES ${GENERATED_SOURCES})
++# No debug info for the generated units, the guest's floating point unfused (the Jaguar has no FMA unit), no strict
++# aliasing (guest memory is read through any type), a section per function (for a later hot-function order), as
++# MP3's port builds its generated code.
++set(VIG8_RECOMP_OPTIONS -g0 -ffp-contract=off -fno-strict-aliasing -ffunction-sections)
++# The registration unit is one long function of SetFunction calls, run once at startup: -O1 and no PCH.
++set_source_files_properties("${VIG8_TREE}/vig8_register.cpp" PROPERTIES
++    COMPILE_OPTIONS "-O1"
++    SKIP_PRECOMPILE_HEADERS ON)
++list(LENGTH VIG8_GUEST_SOURCES _vig8_n)
++message(STATUS "vig8: ${_vig8_n} recompiled sources from ${VIG8_GENERATED}")
++
++add_executable(vig8
++    main_ps4.cpp
++    vig8_ps4.cpp
++    vig8_ps4_game.cpp
++    vig8_ps4_menu.cpp
++    vig8_ps4_achievements.cpp
++)
++
++add_library(vig8_recomp OBJECT ${VIG8_GUEST_SOURCES})
++target_include_directories(vig8_recomp PRIVATE "${VIG8_TREE}")
++target_link_libraries(vig8_recomp PRIVATE rex::runtime)
++rexglue_apply_target_settings(vig8_recomp)
++target_precompile_headers(vig8_recomp PRIVATE "${VIG8_TREE}/vig8_pch.h")
++target_compile_options(vig8_recomp PRIVATE ${VIG8_RECOMP_OPTIONS})
++target_link_libraries(vig8 PRIVATE vig8_recomp)
++target_include_directories(vig8 PRIVATE "${VIG8_TREE}" "${CMAKE_CURRENT_SOURCE_DIR}")
++target_link_libraries(vig8 PRIVATE rex::runtime)
++target_compile_options(vig8 PRIVATE -ffp-contract=off -fno-strict-aliasing)
++
++# The version and the commit it was built from, in the first lines of the log.
++set(VIG8_VERSION "00.00" CACHE STRING "Version in the log")
++execute_process(COMMAND git rev-parse --short=10 HEAD WORKING_DIRECTORY "${VIG8_DIR}"
++                OUTPUT_VARIABLE VIG8_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
++if(NOT VIG8_COMMIT)
++    set(VIG8_COMMIT "unknown")
++endif()
++set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/vig8_ps4.cpp ${CMAKE_CURRENT_SOURCE_DIR}/vig8_ps4_menu.cpp APPEND
++             PROPERTY COMPILE_DEFINITIONS VIG8_VERSION="${VIG8_VERSION}" VIG8_COMMIT="${VIG8_COMMIT}")
++# The quick menu's Lato fonts are #embed'ed (fonts/, SIL Open Font License: fonts/LICENSE-Lato.txt; MP3-PS4's).
++set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/vig8_ps4_menu.cpp APPEND PROPERTY OBJECT_DEPENDS
++             ${CMAKE_CURRENT_SOURCE_DIR}/fonts/Lato-Regular.ttf ${CMAKE_CURRENT_SOURCE_DIR}/fonts/Lato-Black.ttf)
++
++# The runtime, ReXApp and the PS4 entry point, with the Xenos GPU (Vulkan) linked whole; RADV and the kit's WSI; the
++# eboot.
++rexglue_configure_target(vig8 GPU_PLUGINS xenos)
++ps4_kit_link_mesa(vig8)
++ps4_kit_app(vig8)
++# The kit's DNS wrap (ps4_net.cpp) without its SMB/NFS shares (PS4_KIT_NETFS off): the libc member has to be pulled in
++# by name, or __real_getaddrinfo stays an import create-fself refuses (ConkerLR's, MGR's and MP3's fix).
++target_link_options(vig8 PRIVATE --undefined=getaddrinfo)
++# The same for malloc_usable_size, which the kit now wraps too (ps4-kit.cmake PS4_KIT_WRAPS): nothing in this eboot
++# pulls libc's member in, so the wrapped name stayed an undefined import and create-fself refused it ("missing module
++# for symbol (malloc_usable_size)", v00.01's first link).
++target_link_options(vig8 PRIVATE --undefined=malloc_usable_size)
+diff --git a/project/ps4/main_ps4.cpp b/project/ps4/main_ps4.cpp
+new file mode 100644
+index 0000000..facb983
+--- /dev/null
++++ b/project/ps4/main_ps4.cpp
+@@ -0,0 +1,9 @@
++// vig8-ps4 - Vigilante 8 Arcade (Xbox 360 XBLA) on the PS4.
++// The recompiled code is generated from your default.xex by the port's scripts/build-vig8.sh codegen (see
++// CMakeLists.txt here).
++
++#include "vig8_init.h"
++
++#include "vig8_ps4_app.h"
++
++REX_DEFINE_APP(vig8, Vig8App::Create)
+diff --git a/project/ps4/vig8_ps4.cpp b/project/ps4/vig8_ps4.cpp
+new file mode 100644
+index 0000000..9bd5180
+--- /dev/null
++++ b/project/ps4/vig8_ps4.cpp
+@@ -0,0 +1,209 @@
++// vig8-ps4 - Vigilante 8 Arcade on the PS4: the port's settings for ps4-kit's runtime and the SDK, and its
++// diagnostics.
++//
++// /data/V8A is the app's folder: vig8.toml (written on the first start), the logs, the saves, the kit's boot trace
++// and crash log, hang.log (the freeze report). The SDK's executable and user folders point here
++// (sdk/src/core/filesystem_posix.cpp), because /app0 is read-only.
++
++#include "vig8_pch.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <filesystem>
++#include <string>
++#include <system_error>
++#include <thread>
++
++#include <ps4_kit.h>
++#include <ps4_kit_diag.h>
++
++#include <rex/cvar.h>
++#include <rex/kernel/xboxkrnl/video.h>
++#include <rex/logging.h>
++#include <rex/runtime.h>
++
++#include "vig8_ps4.h"
++#include "vig8_ps4_achievements.h"
++#include "vig8_ps4_menu.h"
++
++#include <rex/kernel/xam/ui_hooks.h>
++
++PS4_DIAG_DATA_DIR("/data/V8A");
++
++extern "C" void ps4_kit_configure_heap(ps4_kit_heap_options* options) {
++  options->log_tag = "vig8";
++}
++
++REXCVAR_DEFINE_STRING(vig8_game, "", "Vig8",
++                      "Game folder (the unpacked XBLA package: default.xex, data/ ...). Empty: game/ in the package, "
++                      "then /data/V8A/game");
++REXCVAR_DEFINE_BOOL(vig8_occlusion_queries, false, "Vig8",
++                    "GPU occlusion queries answered by the GPU (the command processor waits for it at each one). "
++                    "false: every query reports its object visible");
++// v00.09: a test - the GPU command processor alternates between core 6 (the other CPU module, as before) and core 2
++// (the game thread's module), one 10 s stats period each; the log's [cp2] lines name each period's core. v00.09 on
++// a PS4 Pro: the same cost a draw on both (2,500 draws: 28.5 ms either way), so core 6 again by default (v00.10).
++REXCVAR_DEFINE_BOOL(vig8_cp_core_test, false, "Vig8",
++                    "Test: the GPU command processor alternates between cores 6 and 2 every 10 s (the log tells "
++                    "which is faster). false: core 6 only");
++// v00.10: the 3D scene's anti-aliasing (vig8_ps4_game.cpp, project/tools/patch_game_fixes.py). The original's 4x MSAA
++// does not fit the 360's EDRAM at 720p, so the game draws the scene in 4 tiles and the GPU emulation translates every
++// draw 4 times; with one sample the scene is drawn once.
++REXCVAR_DEFINE_INT32(vig8_antialiasing, 0, "Vig8",
++                     "The 3D scene's anti-aliasing: 0 = FXAA on the picture (the scene drawn once), 1 = none (the "
++                     "scene drawn once), 2 = the original 4x MSAA (the scene drawn in 4 tiles: every draw 4 times, "
++                     "far slower). Live");
++REXCVAR_DEFINE_BOOL(vig8_msr_global_lock, false, "Vig8",
++                    "The recompiled code's interrupts-off regions (mtmsrd) as one process-wide mutex, as the codegen "
++                    "makes them. false: per-thread state (the atomics inside are host compare-and-swaps already)");
++REXCVAR_DEFINE_BOOL(vig8_freeze_report, true, "Vig8",
++                    "Diagnostic: when the game shows no new frame for 15 s, the stacks of every thread to "
++                    "/data/V8A/hang.log (again 30 s later)");
++REXCVAR_DEFINE_BOOL(vig8_frame_log, true, "Vig8", "A line in the log every 10 s with the game's frames per second");
++REXCVAR_DEFINE_STRING(vig8_radv_debug, "", "Vig8",
++                      "RADV_DEBUG for the GPU driver (RADV's comma-separated debug options; empty: none). v00.02 "
++                      "ran with nofmask,nohiz,nofastclears and the system killed it at the same point as v00.01 (a "
++                      "GPU page fault at the first gameplay frame), so they are not the cause");
++REXCVAR_DEFINE_BOOL(vig8_gpu_trace, false, "Vig8",
++                    "Diagnostic: the GPU driver's flight recorder (RADV_PS4_TRACE): each submission's commands, "
++                    "the memory they point to, every shader's code and the last draw the GPU reached, in "
++                    "/data/Crema/gpu/flight (where the kit's RADV writes), which survive the app being killed by a "
++                    "GPU fault. It found v00.01-v00.03's crash (the tessellation factor ring); it costs speed");
++
++namespace vig8::ps4 {
++
++namespace {
++
++std::atomic<uint32_t> g_swaps{0};
++
++uint64_t NowNs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++
++// Each setting only while it still has the SDK's value: vig8.toml and the command line win.
++void SetDefault(const char* name, const char* value) {
++  if (!rex::cvar::HasNonDefaultValue(name)) rex::cvar::SetFlagByName(name, value);
++}
++
++// At each VdSwap, on the game's thread.
++void OnGuestSwap() {
++  vig8::menu::NoteSwap();  // the quick menu's frame counter and its L3+R3
++  const uint32_t n = g_swaps.fetch_add(1, std::memory_order_acq_rel) + 1;
++  if (!REXCVAR_GET(vig8_frame_log)) return;
++  static uint64_t window_start = 0;
++  static uint32_t window_swaps = 0;
++  const uint64_t now = NowNs();
++  if (!window_start) {
++    window_start = now;
++    window_swaps = n;
++    REXLOG_INFO("[frames] first frame presented");
++    return;
++  }
++  if (now - window_start >= 10'000'000'000ull) {
++    const double seconds = double(now - window_start) / 1e9;
++    REXLOG_INFO("[frames] {:.1f} fps over the last {:.0f} s ({} frames so far)", double(n - window_swaps) / seconds,
++                seconds, n);
++    window_start = now;
++    window_swaps = n;
++  }
++}
++
++// When the game has shown no new frame for 15 s (after at least 60): every thread's stack (ps4-kit's thread dump: host
++// return addresses relative to .text, for llvm-symbolizer --obj=<the build's ELF in ~/vig8-build/oelf>; recompiled
++// guest functions are named sub_XXXXXXXX there) to /data/V8A/hang.log, and once more 30 s later. MP3's freeze report.
++void StartFreezeReport() {
++  std::thread([] {
++    ps4_watch_thread("vig8 freeze watch");
++    const std::string path = std::string(ps4_diag_data_dir()) + "/hang.log";
++    uint32_t last = g_swaps.load(std::memory_order_acquire);
++    auto last_change = std::chrono::steady_clock::now();
++    int dumps = 0;
++    for (;;) {
++      std::this_thread::sleep_for(std::chrono::seconds(1));
++      const uint32_t now_count = g_swaps.load(std::memory_order_acquire);
++      const auto now = std::chrono::steady_clock::now();
++      const double stalled = std::chrono::duration<double>(now - last_change).count();
++      if (now_count != last) {
++        if (dumps) REXLOG_WARN("[freeze] frames again after {:.0f} s ({} thread dumps in {})", stalled, dumps, path);
++        last = now_count;
++        last_change = now;
++        dumps = 0;
++        continue;
++      }
++      if (now_count < 60 || !REXCVAR_GET(vig8_freeze_report)) continue;
++      if ((dumps == 0 && stalled >= 15.0) || (dumps == 1 && stalled >= 45.0)) {
++        ++dumps;
++        const std::string reason = "vig8 freeze report " + std::to_string(dumps) + ": no new frame for " +
++                                   std::to_string(int(stalled)) + " s after " + std::to_string(now_count) + " frames";
++        REXLOG_WARN("[freeze] no new frame for {:.0f} s: the stacks of every thread to {}", stalled, path);
++        rex::FlushLogging();
++        ps4_dump_thread_stacks(path.c_str(), reason.c_str());
++        REXLOG_WARN("[freeze] thread dump {} written", dumps);
++        rex::FlushLogging();
++      }
++    }
++  }).detach();
++}
++
++}  // namespace
++
++void ApplyDefaults() {
++  // The full game rather than the XBLA trial (sp00nznet/vig8's default too).
++  SetDefault("license_mask", "4294967295");
++  // Textures whose fetch constants Xenia calls invalid (type bits 00) are real ones in the 360 games seen so far
++  // (MP3 v00.08's black world); Xenia binds them with this.
++  SetDefault("gpu_allow_invalid_fetch_constants", "true");
++  // Occlusion queries: the SDK's Vulkan command processor ends its submission and waits for the GPU at each one
++  // (MP3 v00.04: the command processor and the GPU took turns). Off unless vig8_occlusion_queries.
++  rex::cvar::SetFlagByName("occlusion_query_enable", REXCVAR_GET(vig8_occlusion_queries) ? "true" : "false");
++  // v00.09: the command processor core test (vig8_cp_core_test, SDK gpu_commands_core_cycle).
++  rex::cvar::SetFlagByName("gpu_commands_core_cycle", REXCVAR_GET(vig8_cp_core_test) ? "6,2" : "");
++  // v00.10: FXAA with vig8_antialiasing 0 (the SDK reads swap_post_effect as the graphics system starts; the quick menu
++  // changes it live through rex_gpu_set_swap_post_effect).
++  rex::cvar::SetFlagByName("swap_post_effect", REXCVAR_GET(vig8_antialiasing) == 0 ? "fxaa" : "none");
++  // The DLC (High Octane Pack) in the package, in the installed-content layout (scripts/dlc-layout.py).
++  std::error_code ec;
++  if (std::filesystem::is_directory("/app0/content", ec)) SetDefault("content_marketplace_root", "/app0/content");
++}
++
++void LogSystem() {
++  const unsigned mhz = ps4_kit_cpu_mhz();
++  REXLOG_INFO("vig8-ps4 {} (commit {}); the CPU cores run at {} MHz ({})", VIG8_VERSION, VIG8_COMMIT, mhz,
++              vig8::menu::ConsoleText());
++  // The GPU driver reads these when the SDK creates its Vulkan instance and device, which comes after this (and after
++  // vig8.toml is read).
++  const std::string radv_debug = REXCVAR_GET(vig8_radv_debug);
++  if (!radv_debug.empty()) setenv("RADV_DEBUG", radv_debug.c_str(), 1);
++  if (REXCVAR_GET(vig8_gpu_trace)) setenv("RADV_PS4_TRACE", "1", 1);
++  REXLOG_INFO("[gpu] driver options: RADV_DEBUG={}; flight recorder {}", radv_debug.empty() ? "(none)" : radv_debug,
++              REXCVAR_GET(vig8_gpu_trace) ? "on (/data/Crema/gpu/flight)" : "off");
++}
++
++void Install(rex::Runtime& runtime) {
++  ppc_msr_cerrojo_global_() = REXCVAR_GET(vig8_msr_global_lock);
++  REXLOG_INFO("[cpu] interrupts-off regions: {}",
++              ppc_msr_cerrojo_global_() ? "one process-wide mutex (codegen)" : "per-thread state");
++  REXLOG_INFO("[gpu] anti-aliasing: {}", REXCVAR_GET(vig8_antialiasing) == 2   ? "4x MSAA (the original: 4 tiles)"
++                                         : REXCVAR_GET(vig8_antialiasing) == 1 ? "none (the scene in one pass)"
++                                                                               : "FXAA (the scene in one pass)");
++  REXLOG_INFO("[gpu] occlusion queries {}; DLC from {}",
++              REXCVAR_GET(vig8_occlusion_queries) ? "on (waits for the GPU)" : "off (reported visible)",
++              rex::cvar::GetFlagByName("content_marketplace_root").empty()
++                  ? std::string("the content root")
++                  : rex::cvar::GetFlagByName("content_marketplace_root"));
++  rex::kernel::xboxkrnl::SetGuestSwapHook(&OnGuestSwap);
++  StartFreezeReport();
++  // The game's achievements: the menu's tab and pop-ups; its own "Achievements" item opens that tab.
++  vig8::achievements::Install(runtime);
++  rex::kernel::xam::SetShowAchievementsUiHook(&vig8::menu::ShowAchievementsList);
++}
++
++unsigned SwapCount() {
++  return g_swaps.load(std::memory_order_acquire);
++}
++
++}  // namespace vig8::ps4
+diff --git a/project/ps4/vig8_ps4.h b/project/ps4/vig8_ps4.h
+new file mode 100644
+index 0000000..27b5a34
+--- /dev/null
++++ b/project/ps4/vig8_ps4.h
+@@ -0,0 +1,30 @@
++// vig8-ps4 - the port's settings, defaults and diagnostics (vig8_ps4.cpp).
++
++#pragma once
++
++#include <string>
++
++#include <rex/cvar.h>
++
++namespace rex {
++class Runtime;
++}
++
++REXCVAR_DECLARE(std::string, vig8_game);
++
++namespace vig8::ps4 {
++
++// OnPreSetup: the port's defaults for SDK settings (full-game license, GPU settings, where the DLC is).
++void ApplyDefaults();
++
++// OnPostInitLogging: version, commit, CPU clock; the GPU driver's options (vig8_radv_debug, vig8_gpu_trace), set
++// before the SDK starts the GPU.
++void LogSystem();
++
++// OnPreLaunchModule: the interrupt-lock mode, the frame counter (a line every 10 s) and the freeze report.
++void Install(rex::Runtime& runtime);
++
++// Frames the game has presented (VdSwap calls).
++unsigned SwapCount();
++
++}  // namespace vig8::ps4
+diff --git a/project/ps4/vig8_ps4_achievements.cpp b/project/ps4/vig8_ps4_achievements.cpp
+new file mode 100644
+index 0000000..802ff3d
+--- /dev/null
++++ b/project/ps4/vig8_ps4_achievements.cpp
+@@ -0,0 +1,92 @@
++// vig8-ps4 - the game's own Xbox 360 achievements, kept on the console and shown the port's way, as in MP3-PS4
++// (v00.06). MP3-PS4's mp3_ps4_achievements.cpp.
++//
++// The SDK does the bookkeeping: the game's achievement write (XGIUserWriteAchievements) reaches
++// KernelState::UnlockAchievement, whose AchievementManager holds the catalog read from the executable's XDBF resource
++// (names, descriptions, gamerscore, flags) and saves the unlocks to <user data>/achievements/<title>.toml. Here: a
++// notification listener that hands each new unlock to the quick menu's pop-up (vig8_ps4_menu.cpp), the SDK's own
++// notification turned off (logros_aviso_en_pantalla) so there is one, and the list the menu's ACHIEVEMENTS tab shows.
++// Every unlock is logged ("[achievements] unlocked"), and the catalog's size at start.
++
++#include "vig8_ps4_achievements.h"
++
++#include "vig8_ps4_menu.h"
++
++#include <ctime>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/runtime.h>
++#include <rex/system/achievement_manager.h>
++#include <rex/system/kernel_state.h>
++
++REXCVAR_DEFINE_BOOL(vig8_achievement_popups, true, "Vig8",
++                    "A pop-up when the game unlocks one of its achievements (the quick menu's style). Live");
++
++namespace vig8::achievements {
++namespace {
++
++rex::system::KernelState* g_kernel = nullptr;
++bool g_listening = false;
++
++// XDBF achievement flags: shown in the list before it is earned.
++constexpr uint32_t kShowUnachieved = 0x8;
++
++}  // namespace
++
++void Install(rex::Runtime& runtime) {
++  g_kernel = runtime.kernel_state();
++  if (!g_kernel || g_listening) return;
++  g_listening = true;
++  rex::cvar::SetFlagByName("logros_aviso_en_pantalla", "false");  // the menu's pop-up instead
++  auto& manager = g_kernel->achievements();
++  manager.RegisterNotificationCallback([](const rex::system::AchievementEvent& event) {
++    REXLOG_INFO("[achievements] unlocked {:08X} \"{}\" ({} G)", event.achievement.id, event.achievement.label,
++                event.achievement.gamerscore);
++    if (REXCVAR_GET(vig8_achievement_popups))
++      vig8::menu::ShowAchievement(event.achievement.label, event.achievement.gamerscore);
++  });
++  const auto list = List();
++  uint32_t unlocked = 0, score = 0, total = 0;
++  for (const Entry& e : list) {
++    total += e.gamerscore;
++    if (e.unlocked) {
++      ++unlocked;
++      score += e.gamerscore;
++    }
++  }
++  REXLOG_INFO("[achievements] {} in the game's catalog, {} unlocked ({} of {} G)", list.size(), unlocked, score,
++              total);
++}
++
++std::vector<Entry> List() {
++  std::vector<Entry> out;
++  if (!g_kernel) return out;
++  const auto& manager = g_kernel->achievements();
++  for (const auto& info : manager.ListAchievements()) {
++    Entry e;
++    e.id = info.id;
++    e.name = info.label;
++    e.description = info.description;
++    e.locked_description = info.unachieved_description;
++    e.gamerscore = info.gamerscore;
++    e.secret = !(info.flags & kShowUnachieved);
++    e.unlocked = manager.IsUnlocked(info.id);
++    e.filetime = e.unlocked ? manager.GetUnlockTime(info.id) : 0;
++    out.push_back(std::move(e));
++  }
++  return out;
++}
++
++std::string DateText(uint64_t filetime) {
++  if (!filetime) return "";
++  const int64_t unix_seconds = int64_t(filetime / 10000000ull) - 11644473600ll;
++  const std::time_t t = std::time_t(unix_seconds);
++  std::tm tm{};
++  gmtime_r(&t, &tm);
++  char text[16];
++  std::strftime(text, sizeof(text), "%Y-%m-%d", &tm);
++  return text;
++}
++
++}  // namespace vig8::achievements
+diff --git a/project/ps4/vig8_ps4_achievements.h b/project/ps4/vig8_ps4_achievements.h
+new file mode 100644
+index 0000000..d9e671d
+--- /dev/null
++++ b/project/ps4/vig8_ps4_achievements.h
+@@ -0,0 +1,36 @@
++// vig8-ps4 - the game's achievements, in the quick menu and as pop-ups (vig8_ps4_achievements.cpp).
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace rex {
++class Runtime;
++}
++
++namespace vig8::achievements {
++
++struct Entry {
++  uint32_t id = 0;
++  std::string name;
++  std::string description;         // what it was for (shown once unlocked)
++  std::string locked_description;  // what to do (shown while locked; may be empty)
++  uint32_t gamerscore = 0;
++  bool secret = false;             // not shown while locked (the game's "show unachieved" flag clear)
++  bool unlocked = false;
++  uint64_t filetime = 0;           // when (Windows FILETIME, UTC)
++};
++
++// OnPreLaunchModule: listens to the SDK's achievement manager (its catalog comes from the game's own data, its unlocks
++// are saved under the user data folder) and turns the SDK's own notification off for the menu's pop-up.
++void Install(rex::Runtime& runtime);
++
++// The game's achievements in its order, with their unlock state (any thread).
++std::vector<Entry> List();
++
++// "2026-11-24" for an unlock time.
++std::string DateText(uint64_t filetime);
++
++}  // namespace vig8::achievements
+diff --git a/project/ps4/vig8_ps4_app.h b/project/ps4/vig8_ps4_app.h
+new file mode 100644
+index 0000000..06e8bad
+--- /dev/null
++++ b/project/ps4/vig8_ps4_app.h
+@@ -0,0 +1,100 @@
++// vig8-ps4 - Vigilante 8 Arcade (Xbox 360 XBLA) on the PS4: the app.
++//
++// The game's files (the unpacked XBLA package: default.xex, data/*.ib, *.ibz ...) are read from game/ inside the
++// package (/app0/game, the one-file package scripts/build-vig8.sh pkg makes), else from /data/V8A/game. The High
++// Octane Pack DLC comes in the package too, as /app0/content in the SDK's installed-content layout
++// (content_marketplace_root). /data/V8A is the app's folder (the SDK's executable and user folder on the PS4): the
++// settings file vig8.toml, the logs, the saves (the content root), the freeze report.
++//
++// What differs from sp00nznet/vig8's Windows build: the GPU is the SDK's Xenos emulation on its Vulkan back end on
++// ps4-kit's RADV (not D3D12), sound through sceAudioOut, the pad through scePad (the SDK's PS4 back ends); no window,
++// no keyboard, no F3/F4 overlays; no System Link yet.
++
++#pragma once
++
++#include <rex/cvar.h>
++#include <rex/filesystem.h>
++#include <rex/logging.h>
++#include <rex/rex_app.h>
++#include <rex/runtime.h>
++#include <rex/system.h>
++
++#include <cstdlib>
++#include <filesystem>
++#include <memory>
++#include <string>
++#include <system_error>
++
++#include <ps4_kit.h>
++
++#include "vig8_ps4.h"
++#include "vig8_ps4_menu.h"
++
++class Vig8App : public rex::ReXApp {
++ public:
++  using rex::ReXApp::ReXApp;
++
++  static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
++    return std::unique_ptr<Vig8App>(new Vig8App(ctx, "vig8", PPCImageConfig));
++  }
++
++ protected:
++  // The SDK's Xenos GPU (Vulkan back end), linked into the eboot, and the port's defaults for SDK settings (each only
++  // while the setting still has the SDK's value, so vig8.toml wins).
++  void OnPreSetup(rex::RuntimeConfig& config) override {
++    if (config.gpu_plugin.empty()) config.gpu_plugin = "xenos";
++    vig8::ps4::ApplyDefaults();
++  }
++
++  // game_data_root is the folder with default.xex (ConstructRuntime checks it).
++  void OnConfigurePaths(rex::PathConfig& paths) override {
++    if (!paths.game_data_root.empty()) return;
++    const std::string flag = REXCVAR_GET(vig8_game);
++    if (!flag.empty()) {
++      paths.game_data_root = flag;
++      return;
++    }
++    if (const auto packaged = PackagedFolder("game", "default.xex"); !packaged.empty()) {
++      paths.game_data_root = packaged;
++      return;
++    }
++    paths.game_data_root = rex::filesystem::GetExecutableFolder() / "game";
++  }
++
++  void OnPostInitLogging() override { vig8::ps4::LogSystem(); }
++
++  // The L3+R3 quick menu and the frame counter (vig8_ps4_menu.cpp); its settings go to the file ReXApp loads
++  // (/data/V8A/vig8.toml).
++  void OnConfigureFonts(ImFontAtlas* atlas) override { vig8::menu::AddFonts(atlas); }
++  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
++    vig8::menu::Attach(app_context(), drawer, rex::filesystem::GetExecutableFolder() / "vig8.toml");
++  }
++
++  void OnLoadXexImage(std::string& xex_image) override {
++    std::error_code ec;
++    const auto root = game_data_root();
++    if (!std::filesystem::is_regular_file(root / "default.xex", ec)) {
++      Fail("Vigilante 8 Arcade: default.xex is missing from " + root.string() +
++           ". Install the package that holds the game, or copy your unpacked XBLA package to /data/V8A/game.");
++    }
++    REXLOG_INFO("vig8: game at {}; loading {}", root.string(), xex_image);
++  }
++
++  void OnPreLaunchModule() override { vig8::ps4::Install(*runtime()); }
++
++ private:
++  // name/ inside the package when it holds marker: before any copy in /data/V8A.
++  static std::filesystem::path PackagedFolder(const char* name, const char* marker) {
++    std::error_code ec;
++    const std::filesystem::path folder = std::filesystem::path("/app0") / name;
++    if (std::filesystem::is_regular_file(folder / marker, ec)) return folder;
++    return {};
++  }
++
++  [[noreturn]] static void Fail(const std::string& msg) {
++    REXLOG_ERROR("{}", msg);
++    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
++    rex::FlushLogging();
++    std::_Exit(1);
++  }
++};
+diff --git a/project/ps4/vig8_ps4_game.cpp b/project/ps4/vig8_ps4_game.cpp
+new file mode 100644
+index 0000000..83d3fe4
+--- /dev/null
++++ b/project/ps4/vig8_ps4_game.cpp
+@@ -0,0 +1,87 @@
++// vig8-ps4 - overrides of recompiled game functions (from sp00nznet/vig8's project/src/stubs.cpp, MIT).
++//
++// Each REX_EXTERN(sub_XXXXXXXX) here replaces the generated weak definition at link time; the original stays callable
++// as __imp__sub_XXXXXXXX. Options are cvars, saved in /data/V8A/vig8.toml.
++//
++// Not here yet from stubs.cpp: the overrides of SDK kernel imports (four-player sign-in, Live privileges, the quit
++// guard): the PS4 build links the SDK's runtime whole, so a second definition of an __imp__Xam* export would clash.
++// Single player needs none of them.
++
++#include "vig8_pch.h"
++#include "vig8_init.h"
++
++#include <atomic>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++REXCVAR_DEFINE_BOOL(unlock_all_cars, false, "Vig8", "Unlock every vehicle (restart the game after changing)");
++REXCVAR_DECLARE(int32_t, vig8_antialiasing);  // vig8_ps4.cpp
++
++// ============================================================================
++// Road patch subdivision work stack (v00.08)
++// ============================================================================
++// project/tools/patch_game_fixes.py: sub_8211F3B8's work stack of road sub-patches has 32 entries and no depth limit;
++// in v00.07 an endless subdivision ran it through the main thread's guest stack top and ended the game. The generated
++// code now pushes only while an entry fits and calls this when one does not (the sub-patch is left out).
++extern "C" void vig8_subdivision_stack_full(uint32_t guest_r1) {
++  static std::atomic<uint32_t> count{0};
++  const uint32_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n == 1 || n % 100 == 0) {
++    REXLOG_WARN(
++        "[fix] road patch subdivision: work stack full, a sub-patch left out ({} times so far; guest r1 {:08X}) - "
++        "the v00.07 crash",
++        n, guest_r1);
++  }
++}
++
++// ============================================================================
++// The 3D scene's anti-aliasing (v00.10)
++// ============================================================================
++// The game draws its 3D scene with 4x MSAA. At 1280x720 that is four times the 360's 10 MB of EDRAM, so the scene
++// renderer (sub_820BE790) splits the screen into four quadrants and the D3D runtime's predicated tiling draws the
++// whole scene once per quadrant. The GPU is meant to skip the draws outside a quadrant, from the screen extents it
++// reports for each draw; the SDK reports the whole screen (as Xenia does), so the GPU emulation - the port's
++// bottleneck - translated every scene draw 4 times (v00.09: Hoover Dam 2,000-3,000 draws a frame, Farmland up to
++// 6,800). project/tools/patch_game_fixes.py makes the renderer's sample count this setting: with one sample the
++// scene fits the EDRAM, the renderer gets one piece and takes its no-tiling branch (its SD-resolution path), and
++// every draw is translated once. The renderer reads it per view, every frame, so it changes while the game runs.
++namespace {
++std::atomic<int32_t> g_scene_msaa_samples{1};
++}  // namespace
++
++// The renderer's MSAA call (li r4,4 before sub_82130D00): the setting, kept for the rest of this view.
++extern "C" int32_t vig8_scene_msaa_begin(void) {
++  const int32_t samples = REXCVAR_GET(vig8_antialiasing) == 2 ? 4 : 1;
++  static int32_t logged = 0;  // the scene renderer runs on one guest thread
++  if (samples != logged) {
++    logged = samples;
++    REXLOG_INFO("[aa] the 3D scene: {}", samples == 4 ? "4x MSAA in 4 tiles (the original: every draw 4 times)"
++                                                      : "one sample, one pass (no tiling)");
++  }
++  g_scene_msaa_samples.store(samples, std::memory_order_relaxed);
++  return samples;
++}
++
++// The EDRAM pieces' sample count (li r6,4 before sub_82130D28): the same as the view's MSAA call.
++extern "C" int32_t vig8_scene_msaa_samples(void) {
++  return g_scene_msaa_samples.load(std::memory_order_relaxed);
++}
++
++// The no-tiling branch: clear the pieces of an earlier 4x frame (not in the original's own 4x path).
++extern "C" int32_t vig8_scene_single_pass(void) {
++  return g_scene_msaa_samples.load(std::memory_order_relaxed) == 1;
++}
++
++// ============================================================================
++// Unlock all vehicles
++// ============================================================================
++// sub_821B80F0 reads a vehicle record; bits 16-19 of the word at +196 (mask 0xF0000) are its unlock state, and zero
++// means locked. Setting them before the original runs makes every vehicle selectable.
++REX_EXTERN(sub_821B80F0) {
++  if (REXCVAR_GET(unlock_all_cars) && ctx.r3.u32) {
++    uint32_t p = ctx.r3.u32 + 196;
++    REX_STORE_U32(p, REX_LOAD_U32(p) | 0xF0000);
++  }
++  __imp__sub_821B80F0(ctx, base);
++}
+diff --git a/project/ps4/vig8_ps4_menu.cpp b/project/ps4/vig8_ps4_menu.cpp
+new file mode 100644
+index 0000000..6c18402
+--- /dev/null
++++ b/project/ps4/vig8_ps4_menu.cpp
+@@ -0,0 +1,1323 @@
++// vig8-ps4 - the L3+R3 quick menu and the frame counter (v00.05): settings to toggle while playing, a frame counter
++// and so on.
++//
++// MP3-PS4's quick menu (mp3/ps4/mp3_ps4_menu.cpp, the same SDK hooks) with Vigilante 8's settings: L3+R3 opens and
++// closes it, Circle closes it, the settings are saved to /data/V8A/vig8.toml on close, the game gets a neutral pad
++// until the closing buttons are released, a CPU profile can start after it closes. It draws its own console-style
++// panel with ImGui's draw lists:
++//
++//   - a side panel that slides in from the left over the dimmed game, in Lato (OFL, fonts/), baked at the sizes it is
++//     drawn at with the TV's density (the SDK's ImGui canvas is 1280x720 on a 1920x1080 output, and its renderer
++//     keeps a fixed font atlas, so a scaled font would be blurry);
++//   - tabs (L1/R1), rows of settings moved through with the D-pad: a choice changes with left/right, a switch and an
++//     action with Cross; the selected row's description below, with a "next start" tag for the settings that only
++//     apply on a restart; the buttons' hints at the bottom;
++//   - the frame counter in a corner: the game's frames a second (its VdSwap calls), with the frame times and a graph
++//     of the last 120 in the detailed mode.
++//
++// The dialog exists only while the menu is open, the counter is on, or the "saved" note shows: with no dialog the
++// presenter paints from the game's thread at once, with one it paints on the UI thread (presenter.cpp's paint modes).
++// The L3+R3 press comes from the pad driver (PS4InputDriver::TakeMenuCombo), checked at each of the game's frames.
++
++#include "vig8_ps4_menu.h"
++
++#include "vig8_ps4_achievements.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <deque>
++#include <filesystem>
++#include <functional>
++#include <memory>
++#include <string>
++#include <system_error>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include <imgui.h>
++
++#include <ps4_kit.h>
++#include <ps4_kit_diag.h>
++
++#include <rex/cvar.h>
++#include <rex/input/ps4/ps4_input_driver.h>
++#include <rex/logging.h>
++#include <rex/ui/imgui_dialog.h>
++#include <rex/ui/imgui_drawer.h>
++#include <rex/ui/windowed_app_context.h>
++
++#ifndef VIG8_VERSION
++#define VIG8_VERSION "ps4"
++#endif
++#ifndef VIG8_COMMIT
++#define VIG8_COMMIT "unknown"
++#endif
++
++// libkernel: 1 on a PS4 Pro (whatever mode the app runs in).
++extern "C" int32_t sceKernelHasNeoMode(void);
++// The SDK (vulkan/command_processor.cpp, v00.10): the swap post effect, live (0 none, 1 FXAA).
++extern "C" void rex_gpu_set_swap_post_effect(int32_t effect);
++
++REXCVAR_DEFINE_INT32(vig8_frame_counter, 0, "Vig8",
++                     "The frame counter: 0 = off, 1 = frames a second, 2 = with the frame times and a graph")
++    .range(0, 2);
++REXCVAR_DEFINE_INT32(vig8_frame_counter_corner, 0, "Vig8", "The frame counter's corner: 0 = top left, 1 = top right")
++    .range(0, 1);
++REXCVAR_DEFINE_BOOL(vig8_auto_profile, true, "Vig8",
++                    "Diagnostic: once a session, the first time the game stays under vig8_auto_profile_fps for "
++                    "vig8_auto_profile_s seconds, record an 8 s CPU profile of every thread (/data/V8A/profiles)");
++REXCVAR_DEFINE_INT32(vig8_auto_profile_fps, 25, "Vig8", "Diagnostic, vig8_auto_profile: under this many frames a second")
++    .range(1, 60);
++REXCVAR_DEFINE_INT32(vig8_auto_profile_s, 15, "Vig8", "Diagnostic, vig8_auto_profile: for this many seconds in a row")
++    .range(1, 600);
++
++namespace vig8::menu {
++
++namespace {
++
++// ---------------------------------------------------------------------------------------------------------------------
++// Fonts.
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wc23-extensions"
++const unsigned char kLatoRegular[] = {
++#embed "fonts/Lato-Regular.ttf"
++};
++const unsigned char kLatoBlack[] = {
++#embed "fonts/Lato-Black.ttf"
++};
++#pragma clang diagnostic pop
++
++// The sizes on the 720-line canvas.
++struct Fonts {
++  ImFont* title = nullptr;    // Black 40, capitals and digits only
++  ImFont* tab = nullptr;      // Black 15
++  ImFont* row = nullptr;      // Regular 18
++  ImFont* value = nullptr;    // Black 16
++  ImFont* body = nullptr;     // Regular 14
++  ImFont* counter = nullptr;  // Black 26
++  ImFont* small = nullptr;    // Regular 12
++};
++Fonts g_fonts;
++
++// The canvas's pixels on the TV (FisicoALogico in imgui_drawer.cpp: 720 logical lines on 1080).
++constexpr float kDensity = 1080.0f / 720.0f;
++
++ImFont* AddLato(ImFontAtlas* atlas, const unsigned char* data, size_t size, float pixels, const ImWchar* ranges) {
++  ImFontConfig config;
++  config.FontDataOwnedByAtlas = false;
++  config.RasterizerDensity = kDensity;
++  config.OversampleH = 2;
++  config.OversampleV = 1;
++  return atlas->AddFontFromMemoryTTF(const_cast<unsigned char*>(data), int(size), pixels, &config, ranges);
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// Frame times: the game's swaps, written on its thread, read on the UI thread.
++
++constexpr uint32_t kRing = 256;
++std::array<std::atomic<uint64_t>, kRing> g_swap_ns{};
++std::atomic<uint32_t> g_swaps{0};
++
++uint64_t NowNs() {
++  return uint64_t(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++          .count());
++}
++
++struct FrameStats {
++  float fps = 0.0f;
++  float frame_ms = 0.0f;
++  float worst_ms = 0.0f;
++  std::vector<float> history;  // the last frames' times, oldest first
++};
++
++FrameStats ReadStats(size_t history) {
++  FrameStats stats;
++  const uint32_t count = g_swaps.load(std::memory_order_acquire);
++  const uint32_t have = std::min(count, kRing);
++  if (have < 2) return stats;
++  std::vector<uint64_t> times(have);
++  for (uint32_t i = 0; i < have; ++i) {
++    times[i] = g_swap_ns[(count - have + i) % kRing].load(std::memory_order_relaxed);
++  }
++  const uint64_t now = NowNs();
++  // Frames in the last second (none if the game has not swapped for a second: a load or a stall).
++  uint32_t in_second = 0;
++  double sum_ms = 0.0;
++  float worst = 0.0f;
++  for (uint32_t i = have - 1; i > 0; --i) {
++    if (times[i] < times[i - 1] || now - times[i] > 1'000'000'000ull) break;
++    const float ms = float(double(times[i] - times[i - 1]) / 1e6);
++    ++in_second;
++    sum_ms += ms;
++    worst = std::max(worst, ms);
++  }
++  if (in_second) {
++    stats.frame_ms = float(sum_ms / in_second);
++    stats.fps = stats.frame_ms > 0.0f ? 1000.0f / stats.frame_ms : 0.0f;
++    stats.worst_ms = worst;
++  }
++  const size_t n = std::min<size_t>(history, have - 1);
++  stats.history.reserve(n);
++  for (size_t i = have - n; i < have; ++i) {
++    stats.history.push_back(times[i] >= times[i - 1] ? float(double(times[i] - times[i - 1]) / 1e6) : 0.0f);
++  }
++  return stats;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// Look: the desert orange of the game's menus.
++
++constexpr ImU32 kPanel = IM_COL32(14, 11, 9, 246);
++constexpr ImU32 kAccent = IM_COL32(230, 122, 34, 255);
++constexpr ImU32 kText = IM_COL32(240, 236, 230, 255);
++constexpr ImU32 kDim = IM_COL32(152, 146, 138, 255);
++constexpr ImU32 kFaint = IM_COL32(82, 78, 72, 255);
++constexpr ImU32 kLine = IM_COL32(255, 255, 255, 22);
++constexpr ImU32 kAmber = IM_COL32(232, 190, 64, 255);
++constexpr ImU32 kGood = IM_COL32(110, 226, 120, 255);
++constexpr ImU32 kFair = IM_COL32(240, 206, 90, 255);
++constexpr ImU32 kBad = IM_COL32(240, 104, 96, 255);
++
++ImU32 WithAlpha(ImU32 colour, float alpha) {
++  const uint32_t a = uint32_t(std::clamp(alpha, 0.0f, 1.0f) * float((colour >> IM_COL32_A_SHIFT) & 0xFF) + 0.5f);
++  return (colour & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
++}
++
++ImU32 AccentAlpha(int alpha) { return (kAccent & ~IM_COL32_A_MASK) | (uint32_t(alpha) << IM_COL32_A_SHIFT); }
++
++ImU32 FpsColour(float fps) { return fps >= 57.0f ? kGood : fps >= 28.0f ? kFair : kBad; }
++
++float EaseOut(float t) {
++  t = std::clamp(t, 0.0f, 1.0f);
++  return 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
++}
++
++ImVec2 TextSize(ImFont* font, const char* text) { return font->CalcTextSizeA(font->LegacySize, FLT_MAX, 0.0f, text); }
++
++void Text(ImDrawList* draw, ImFont* font, ImVec2 pos, ImU32 colour, const char* text, float wrap = 0.0f) {
++  draw->AddText(font, font->LegacySize, pos, colour, text, nullptr, wrap);
++}
++
++// The DualShock 4's button marks for the hints, drawn (no glyphs needed).
++enum class Mark { kCross, kCircle, kDpadVertical, kDpadHorizontal };
++
++float DrawMark(ImDrawList* draw, Mark mark, ImVec2 centre, float r, float alpha) {
++  const ImU32 ring = WithAlpha(kDim, alpha);
++  switch (mark) {
++    case Mark::kCross: {
++      draw->AddCircle(centre, r, ring, 24, 1.4f);
++      const float k = r * 0.42f;
++      const ImU32 c = WithAlpha(IM_COL32(124, 166, 232, 255), alpha);
++      draw->AddLine(ImVec2(centre.x - k, centre.y - k), ImVec2(centre.x + k, centre.y + k), c, 1.8f);
++      draw->AddLine(ImVec2(centre.x - k, centre.y + k), ImVec2(centre.x + k, centre.y - k), c, 1.8f);
++      break;
++    }
++    case Mark::kCircle:
++      draw->AddCircle(centre, r, ring, 24, 1.4f);
++      draw->AddCircle(centre, r * 0.46f, WithAlpha(IM_COL32(236, 104, 104, 255), alpha), 20, 1.8f);
++      break;
++    case Mark::kDpadVertical:
++    case Mark::kDpadHorizontal: {
++      draw->AddCircle(centre, r, ring, 24, 1.4f);
++      const float a = r * 0.36f, b = r * 0.62f;
++      const ImU32 c = WithAlpha(kText, alpha);
++      if (mark == Mark::kDpadVertical) {
++        draw->AddTriangleFilled(ImVec2(centre.x, centre.y - b), ImVec2(centre.x - a, centre.y - b + a),
++                                ImVec2(centre.x + a, centre.y - b + a), c);
++        draw->AddTriangleFilled(ImVec2(centre.x, centre.y + b), ImVec2(centre.x + a, centre.y + b - a),
++                                ImVec2(centre.x - a, centre.y + b - a), c);
++      } else {
++        draw->AddTriangleFilled(ImVec2(centre.x - b, centre.y), ImVec2(centre.x - b + a, centre.y + a),
++                                ImVec2(centre.x - b + a, centre.y - a), c);
++        draw->AddTriangleFilled(ImVec2(centre.x + b, centre.y), ImVec2(centre.x + b - a, centre.y - a),
++                                ImVec2(centre.x + b - a, centre.y + a), c);
++      }
++      break;
++    }
++  }
++  return r * 2.0f;
++}
++
++// A shoulder button's label in a rounded box ("L1"); returns its width.
++float DrawKeyCap(ImDrawList* draw, const char* label, ImVec2 pos, float height, float alpha) {
++  ImFont* font = g_fonts.small;
++  const ImVec2 size = TextSize(font, label);
++  const float w = std::max(height * 1.5f, size.x + height * 0.7f);
++  draw->AddRect(pos, ImVec2(pos.x + w, pos.y + height), WithAlpha(kDim, alpha), height * 0.3f, 0, 1.3f);
++  Text(draw, font, ImVec2(pos.x + (w - size.x) * 0.5f, pos.y + (height - size.y) * 0.5f), WithAlpha(kText, alpha),
++       label);
++  return w;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// The settings.
++
++void SetCvar(const char* name, const std::string& value) {
++  if (!rex::cvar::SetFlagByName(name, value)) REXLOG_WARN("[menu] could not set {} = {}", name, value);
++}
++
++struct Row {
++  enum class Kind { kChoice, kSwitch, kAction, kInfo, kEntry };  // kEntry: selectable, read-only (an achievement)
++  Kind kind = Kind::kInfo;
++  std::string label;
++  std::string help;
++  bool restart = false;              // takes effect on the next start
++  std::vector<std::string> options;  // kChoice
++  std::function<int()> get;          // kChoice: the option; kSwitch: 0/1
++  std::function<void(int)> set;
++  std::function<void()> run;  // kAction
++  std::string info;           // kInfo / kEntry: the value shown
++  ImU32 trophy = 0;           // kEntry: a trophy of this colour before the label (0: none)
++  bool earned = false;        // kEntry: drawn bright (else dim)
++};
++
++constexpr double kProfileSeconds = 8.0;
++constexpr const char* kTabs[] = {"GAME", "OVERLAY", "DIAGNOSTICS", "ACHIEVEMENTS", "ABOUT"};
++constexpr int kTabCount = 5;
++constexpr int kAchievementsTab = 3;
++constexpr int kAboutTab = 4;
++
++// The trophies' colours by the achievement's gamerscore (the PS4's tiers: 50+ gold, 20+ silver).
++constexpr ImU32 kGold = IM_COL32(230, 186, 74, 255);
++constexpr ImU32 kSilver = IM_COL32(196, 200, 210, 255);
++constexpr ImU32 kBronze = IM_COL32(196, 124, 72, 255);
++ImU32 TierColour(uint32_t gamerscore) { return gamerscore >= 50 ? kGold : gamerscore >= 20 ? kSilver : kBronze; }
++
++// A trophy cup of height 2*r centred at c.
++void DrawTrophy(ImDrawList* draw, ImVec2 c, float r, ImU32 colour) {
++  const float w = r * 1.1f;
++  draw->AddRectFilled(ImVec2(c.x - w, c.y - r), ImVec2(c.x + w, c.y + r * 0.15f), colour, w * 0.9f,
++                      ImDrawFlags_RoundCornersBottom);
++  draw->AddCircle(ImVec2(c.x - w, c.y - r * 0.45f), r * 0.38f, colour, 12, r * 0.18f);
++  draw->AddCircle(ImVec2(c.x + w, c.y - r * 0.45f), r * 0.38f, colour, 12, r * 0.18f);
++  draw->AddRectFilled(ImVec2(c.x - r * 0.16f, c.y + r * 0.1f), ImVec2(c.x + r * 0.16f, c.y + r * 0.62f), colour);
++  draw->AddRectFilled(ImVec2(c.x - r * 0.62f, c.y + r * 0.62f), ImVec2(c.x + r * 0.62f, c.y + r), colour, r * 0.12f);
++}
++
++// The pad buttons that, held when the menu closes, would reach the game as a press.
++constexpr ImGuiKey kHeldKeys[] = {
++    ImGuiKey_GamepadFaceDown, ImGuiKey_GamepadFaceRight, ImGuiKey_GamepadFaceUp,   ImGuiKey_GamepadFaceLeft,
++    ImGuiKey_GamepadDpadUp,   ImGuiKey_GamepadDpadDown,  ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadDpadRight,
++    ImGuiKey_GamepadL1,       ImGuiKey_GamepadR1,        ImGuiKey_GamepadL3,       ImGuiKey_GamepadR3,
++    ImGuiKey_GamepadStart,    ImGuiKey_GamepadBack,
++};
++
++bool AnyButtonDown() {
++  for (const ImGuiKey key : kHeldKeys) {
++    if (ImGui::IsKeyDown(key)) return true;
++  }
++  return false;
++}
++
++// The menu's own repaints (ImGuiDrawer::SetContinuousRepaint(false)): 60 a second while it animates or has the pad,
++// from a ticker thread that asks the UI thread; otherwise the overlay is repainted with the game's frames.
++std::atomic<bool> g_animating{false};
++
++void StartRepaintTicker();
++
++// L3+R3 presses the pad driver reports while the menu is open, or as it closes, are the menu's own.
++std::atomic<bool> g_menu_owns_combo{false};
++std::atomic<uint64_t> g_combo_quiet_until_ns{0};
++
++class QuickMenu;
++
++struct State {
++  rex::ui::WindowedAppContext* context = nullptr;
++  rex::ui::ImGuiDrawer* drawer = nullptr;
++  std::filesystem::path config;
++  QuickMenu* dialog = nullptr;  // UI thread only (made in Dialog, deleted in ReleaseLater)
++};
++State g_state;
++
++void Open(int tab = -1);
++void ReleaseLater();
++QuickMenu& Dialog();
++std::string DlcText();
++
++class QuickMenu final : public rex::ui::ImGuiDialog {
++ public:
++  explicit QuickMenu(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
++
++  // tab >= 0: open on that tab (the game's own "Achievements" item opens ACHIEVEMENTS).
++  void Show(int tab = -1) {
++    if (tab >= 0 && tab < kTabCount && tab != tab_) {
++      tab_ = tab;
++      selected_ = -1;
++      first_ = 0;
++    }
++    if (phase_ == Phase::kOpen || phase_ == Phase::kOpening) return;
++    phase_ = Phase::kOpening;
++    combo_held_ = tab < 0;  // the L3+R3 that opened it is still down
++    jump_ = true;
++    dirty_ = false;
++    g_menu_owns_combo = true;
++    REXLOG_INFO("[menu] opened ({})", tab < 0 ? "L3+R3" : "the game's Achievements item");
++  }
++
++  // An achievement's pop-up, after the ones before it (UI thread).
++  void PushAchievement(std::string name, uint32_t gamerscore) { popups_.push_back({std::move(name), gamerscore}); }
++
++  // Nothing left to draw: the dialog can go.
++  bool Idle() const {
++    return phase_ == Phase::kClosed && REXCVAR_GET(vig8_frame_counter) <= 0 && toast_left_ <= 0.0f &&
++           !PopupActive() && !start_profile_ && ps4_profile_running() == 0;
++  }
++
++ protected:
++  void OnDraw(ImGuiIO& io) override {
++    const float dt = std::clamp(io.DeltaTime, 0.0f, 0.1f);
++    const bool combo = ImGui::IsKeyDown(ImGuiKey_GamepadL3) && ImGui::IsKeyDown(ImGuiKey_GamepadR3);
++    if (combo && !combo_held_ && (phase_ == Phase::kOpen || phase_ == Phase::kOpening)) Close();
++    combo_held_ = combo;
++
++    // The slide: 0.2 s in, 0.14 s out.
++    if (phase_ == Phase::kOpening) {
++      open_ = std::min(1.0f, open_ + dt / 0.20f);
++      if (open_ >= 1.0f) phase_ = Phase::kOpen;
++    } else if (phase_ == Phase::kClosing) {
++      open_ = std::max(0.0f, open_ - dt / 0.14f);
++      if (open_ <= 0.0f) phase_ = AnyButtonDown() ? Phase::kReleasing : Phase::kClosed;
++    } else if (phase_ == Phase::kReleasing && !AnyButtonDown()) {
++      phase_ = Phase::kClosed;
++    }
++    if (phase_ == Phase::kClosed && g_menu_owns_combo.exchange(false)) {
++      g_combo_quiet_until_ns = NowNs() + 400'000'000ull;
++    }
++    if (start_profile_ && phase_ == Phase::kClosed) {
++      start_profile_ = false;
++      ps4_profile_set_enabled(1);
++      const bool started = ps4_profile_start(kProfileSeconds, "quick menu");
++      REXLOG_INFO("[menu] CPU profile of {:.0f} s {}", kProfileSeconds, started ? "started" : "not started");
++    }
++
++    const bool visible = phase_ == Phase::kOpening || phase_ == Phase::kOpen || phase_ == Phase::kClosing;
++    if (visible) {
++      DrawMenu(io, dt);
++    } else if (phase_ == Phase::kReleasing) {
++      HoldFocus();
++    }
++    DrawCounter(io, visible);
++    DrawToast(io, dt);
++    DrawPopup(io, dt);
++    g_animating.store(phase_ != Phase::kClosed || toast_left_ > 0.0f || PopupActive(), std::memory_order_relaxed);
++    if (Idle()) ReleaseLater();
++  }
++
++ private:
++  enum class Phase { kClosed, kOpening, kOpen, kClosing, kReleasing };
++
++  void Close() {
++    if (phase_ != Phase::kOpen && phase_ != Phase::kOpening) return;
++    phase_ = Phase::kClosing;
++    rex::cvar::SaveConfig(g_state.config);
++    if (dirty_) toast_left_ = 2.2f;
++    REXLOG_INFO("[menu] closed{}: frame counter {}, unlock all cars {}, auto profile {}",
++                dirty_ ? ", settings saved" : "", REXCVAR_GET(vig8_frame_counter),
++                rex::cvar::Query<bool>("unlock_all_cars"), REXCVAR_GET(vig8_auto_profile));
++  }
++
++  std::vector<Row> BuildRows(int tab) {
++    std::vector<Row> rows;
++    switch (tab) {
++      case 0: {
++        Row cars;
++        cars.kind = Row::Kind::kSwitch;
++        cars.label = "Unlock all cars";
++        cars.get = [] { return rex::cvar::Query<bool>("unlock_all_cars") ? 1 : 0; };
++        cars.set = [](int v) { SetCvar("unlock_all_cars", v ? "true" : "false"); };
++        cars.restart = true;
++        cars.help =
++            "Every vehicle in the selection screen, without beating the quests first (the game reads its unlocks "
++            "as it starts).";
++        rows.push_back(std::move(cars));
++
++        // v00.10: vig8_antialiasing (vig8_ps4_game.cpp), live - the game reads it every frame; FXAA through the SDK.
++        Row aa;
++        aa.kind = Row::Kind::kChoice;
++        aa.label = "Anti-aliasing";
++        aa.options = {"FXAA  (fast)", "Off  (fastest)", "4x MSAA  (original, slow)"};
++        aa.get = [] { return std::clamp(rex::cvar::Query<int32_t>("vig8_antialiasing"), 0, 2); };
++        aa.set = [](int v) {
++          SetCvar("vig8_antialiasing", std::to_string(v));
++          rex_gpu_set_swap_post_effect(v == 0 ? 1 : 0);
++        };
++        aa.help =
++            "The original's 4x MSAA does not fit the Xbox 360's video memory, so the game draws the whole 3D scene "
++            "4 times, once per quarter of the screen, and each of those draws costs the PS4 its full price. FXAA "
++            "and Off draw the scene once (FXAA then smooths the edges): far faster in busy places.";
++        rows.push_back(std::move(aa));
++
++        Row occlusion;
++        occlusion.kind = Row::Kind::kChoice;
++        occlusion.label = "Occlusion queries";
++        occlusion.options = {"Fixed  (fast)", "GPU queries  (slow)"};
++        occlusion.get = [] { return rex::cvar::Query<bool>("vig8_occlusion_queries") ? 1 : 0; };
++        occlusion.set = [](int v) { SetCvar("vig8_occlusion_queries", v ? "true" : "false"); };
++        occlusion.restart = true;
++        occlusion.help =
++            "The game can ask the GPU whether objects are hidden. Answering for real waits for the whole GPU at "
++            "every question; Fixed answers \"visible\" at once.";
++        rows.push_back(std::move(occlusion));
++
++        // v00.07: the SDK's vblank_at_gpu_wait (graphics_system.cpp), live.
++        Row pacing;
++        pacing.kind = Row::Kind::kChoice;
++        pacing.label = "Frame pacing";
++        pacing.options = {"Flip when ready  (fast)", "Wait for the 60 Hz tick"};
++        pacing.get = [] { return rex::cvar::Query<bool>("vblank_at_gpu_wait") ? 0 : 1; };
++        pacing.set = [](int v) { SetCvar("vblank_at_gpu_wait", v ? "false" : "true"); };
++        pacing.help =
++            "After each frame the game waits for the console's next screen refresh before it starts the next one. "
++            "Flip when ready lets that refresh happen as soon as the frame is done (still 60 a second at most, so "
++            "the game keeps its speed); below 60 fps that is worth a few frames a second.";
++        rows.push_back(std::move(pacing));
++
++        // v00.08: the SDK's gpu_rt_update_skip (vulkan/render_target_cache.cpp) and gpu_shader_load_cache
++        // (command_processor.cpp), both live - off = v00.07's path, to tell whether a picture problem comes from them.
++        Row shortcuts;
++        shortcuts.kind = Row::Kind::kChoice;
++        shortcuts.label = "GPU shortcuts";
++        shortcuts.options = {"On  (faster)", "Off  (v00.07)"};
++        shortcuts.get = [] {
++          return rex::cvar::Query<bool>("gpu_rt_update_skip") && rex::cvar::Query<bool>("gpu_shader_load_cache") ? 0
++                                                                                                                : 1;
++        };
++        shortcuts.set = [](int v) {
++          SetCvar("gpu_rt_update_skip", v ? "false" : "true");
++          SetCvar("gpu_shader_load_cache", v ? "false" : "true");
++        };
++        shortcuts.help =
++            "Skips work the GPU emulation repeats for every draw: setting up the same render targets again and "
++            "looking up the same shaders again. If something looks wrong on screen, switch this off to see "
++            "whether it comes from them.";
++        rows.push_back(std::move(shortcuts));
++
++        // v00.09: vig8_cp_core_test / the SDK's gpu_commands_core_cycle, live (it applies at the next frame).
++        Row cp_core;
++        cp_core.kind = Row::Kind::kChoice;
++        cp_core.label = "GPU emulation core";
++        cp_core.options = {"Core 6", "Alternate 6 / 2  (test)"};
++        cp_core.get = [] { return rex::cvar::Query<bool>("vig8_cp_core_test") ? 1 : 0; };
++        cp_core.set = [](int v) {
++          SetCvar("vig8_cp_core_test", v ? "true" : "false");
++          SetCvar("gpu_commands_core_cycle", v ? "6,2" : "");
++        };
++        cp_core.help =
++            "The test of v00.09: the GPU emulation moves between CPU core 6 and core 2 every 10 seconds and the "
++            "log records how fast each one runs (both were the same speed, so Core 6 it is).";
++        rows.push_back(std::move(cp_core));
++        break;
++      }
++      case 1: {
++        Row counter;
++        counter.kind = Row::Kind::kChoice;
++        counter.label = "Frame counter";
++        counter.options = {"Off", "FPS", "Detailed"};
++        counter.get = [] { return int(REXCVAR_GET(vig8_frame_counter)); };
++        counter.set = [](int v) { SetCvar("vig8_frame_counter", std::to_string(v)); };
++        counter.help =
++            "The game's frames a second, counted at its swaps. Detailed adds the average and worst frame time of "
++            "the last second, and a graph of the last 120 frames (the drops show as spikes).";
++        rows.push_back(std::move(counter));
++
++        Row corner;
++        corner.kind = Row::Kind::kChoice;
++        corner.label = "Position";
++        corner.options = {"Top left", "Top right"};
++        corner.get = [] { return int(REXCVAR_GET(vig8_frame_counter_corner)); };
++        corner.set = [](int v) { SetCvar("vig8_frame_counter_corner", std::to_string(v)); };
++        corner.help = "Where the frame counter sits on the screen.";
++        rows.push_back(std::move(corner));
++        break;
++      }
++      case 2: {
++        Row profile;
++        profile.kind = Row::Kind::kAction;
++        profile.label = "Record a CPU profile";
++        profile.run = [this] {
++          start_profile_ = true;
++          Close();
++        };
++        profile.help = fmt::format(
++            "Closes the menu, then samples every thread for {:.0f} s of play and writes the result to {}/profiles: "
++            "what to send when a scene is slow.",
++            kProfileSeconds, ps4_diag_data_dir());
++        rows.push_back(std::move(profile));
++
++        Row autop;
++        autop.kind = Row::Kind::kSwitch;
++        autop.label = "Profile slow gameplay";
++        autop.get = [] { return REXCVAR_GET(vig8_auto_profile) ? 1 : 0; };
++        autop.set = [](int v) { SetCvar("vig8_auto_profile", v ? "true" : "false"); };
++        autop.help = fmt::format(
++            "Once a session, the first time the game stays under {} FPS for {} s, records an {:.0f} s CPU profile "
++            "to {}/profiles on its own.",
++            REXCVAR_GET(vig8_auto_profile_fps), REXCVAR_GET(vig8_auto_profile_s), kProfileSeconds,
++            ps4_diag_data_dir());
++        rows.push_back(std::move(autop));
++
++        Row freeze;
++        freeze.kind = Row::Kind::kSwitch;
++        freeze.label = "Freeze report";
++        freeze.get = [] { return rex::cvar::Query<bool>("vig8_freeze_report") ? 1 : 0; };
++        freeze.set = [](int v) { SetCvar("vig8_freeze_report", v ? "true" : "false"); };
++        freeze.help = fmt::format(
++            "When the game shows no new frame for 15 s, writes where every thread is to {}/hang.log (again 30 s "
++            "later): what to send after a freeze.",
++            ps4_diag_data_dir());
++        rows.push_back(std::move(freeze));
++
++        Row frames;
++        frames.kind = Row::Kind::kSwitch;
++        frames.label = "Frame rate log";
++        frames.get = [] { return rex::cvar::Query<bool>("vig8_frame_log") ? 1 : 0; };
++        frames.set = [](int v) { SetCvar("vig8_frame_log", v ? "true" : "false"); };
++        frames.help = "A line in the log every 10 s with the game's frames a second.";
++        rows.push_back(std::move(frames));
++
++        Row waits;
++        waits.kind = Row::Kind::kSwitch;
++        waits.label = "Long-wait log";
++        waits.get = [] { return rex::cvar::Query<bool>("kernel_wait_report") ? 1 : 0; };
++        waits.set = [](int v) { SetCvar("kernel_wait_report", v ? "true" : "false"); };
++        waits.help = fmt::format(
++            "Every {} s, writes the game threads that have waited 2 s or more to the log in {}/logs: what to send "
++            "when the game stops.",
++            rex::cvar::Query<int32_t>("kernel_wait_report_s"), ps4_diag_data_dir());
++        rows.push_back(std::move(waits));
++
++        Row trace;
++        trace.kind = Row::Kind::kSwitch;
++        trace.label = "GPU fault recorder";
++        trace.get = [] { return rex::cvar::Query<bool>("vig8_gpu_trace") ? 1 : 0; };
++        trace.set = [](int v) { SetCvar("vig8_gpu_trace", v ? "true" : "false"); };
++        trace.restart = true;
++        trace.help =
++            "The GPU driver keeps the last 32 frames' commands and how far the GPU got, in /data/Crema/gpu/flight: "
++            "what found the crash at the first match. Slower; only to send after a GPU crash.";
++        rows.push_back(std::move(trace));
++
++        Row logs;
++        logs.label = "Logs";
++        logs.info = fmt::format("{}/logs", ps4_diag_data_dir());
++        rows.push_back(std::move(logs));
++        break;
++      }
++      case kAchievementsTab: {  // the game's achievements (vig8_ps4_achievements.cpp)
++        const auto list = vig8::achievements::List();
++        uint32_t got = 0, score = 0, total = 0;
++        for (const auto& e : list) {
++          total += e.gamerscore;
++          if (e.unlocked) {
++            ++got;
++            score += e.gamerscore;
++          }
++        }
++        Row summary;
++        summary.label = "Unlocked";
++        summary.info = list.empty() ? "the game's list is not loaded yet"
++                                    : fmt::format("{} of {}  ·  {} of {} G", got, list.size(), score, total);
++        rows.push_back(std::move(summary));
++        Row popups;
++        popups.kind = Row::Kind::kSwitch;
++        popups.label = "Unlock pop-ups";
++        popups.get = [] { return rex::cvar::Query<bool>("vig8_achievement_popups") ? 1 : 0; };
++        popups.set = [](int v) { SetCvar("vig8_achievement_popups", v ? "true" : "false"); };
++        popups.help =
++            "A pop-up at the top of the screen when you earn an achievement. Your achievements are kept on the "
++            "console, in the game's data folder.";
++        rows.push_back(std::move(popups));
++        Row test;
++        test.kind = Row::Kind::kAction;
++        test.label = "Test pop-up";
++        test.run = [this] { PushAchievement("Achievement test", 50); };
++        test.help = "Shows what an unlock looks like (nothing is unlocked).";
++        rows.push_back(std::move(test));
++        for (const auto& e : list) {
++          Row row;
++          row.kind = Row::Kind::kEntry;
++          const bool hidden = e.secret && !e.unlocked;
++          row.label = hidden ? "Secret achievement" : e.name;
++          row.trophy = TierColour(e.gamerscore);
++          row.earned = e.unlocked;
++          row.info = e.unlocked ? vig8::achievements::DateText(e.filetime) : fmt::format("{} G", e.gamerscore);
++          if (hidden) {
++            row.help = "Keep playing to reveal it.";
++          } else {
++            const std::string& d = e.unlocked || e.locked_description.empty() ? e.description : e.locked_description;
++            row.help = fmt::format("{}  ({} G){}", d, e.gamerscore, e.unlocked ? "  ·  unlocked" : "");
++          }
++          rows.push_back(std::move(row));
++        }
++        break;
++      }
++      default: {
++        auto info = [&rows](const char* label, std::string value) {
++          Row row;
++          row.label = label;
++          row.info = std::move(value);
++          rows.push_back(std::move(row));
++        };
++        info("Build", fmt::format("v{}  ·  {}", VIG8_VERSION, VIG8_COMMIT));
++        info("Game", "Vigilante 8 Arcade, Xbox Live Arcade (2008)");
++        info("DLC", DlcText());
++        const unsigned mhz = ps4_kit_cpu_mhz();
++        info("CPU", fmt::format("PowerPC recompiled to x86-64, cores at {:.2f} GHz", mhz / 1000.0));
++        info("Console", ConsoleText());
++        info("GPU", "Xenos emulation on Vulkan (RADV)");
++        info("Menu", "L3 + R3 opens and closes it");
++        break;
++      }
++    }
++    return rows;
++  }
++
++  static bool Selectable(const Row& row) { return row.kind != Row::Kind::kInfo; }  // kEntry is
++
++  void MoveSelection(const std::vector<Row>& rows, int step) {
++    if (rows.empty()) return;
++    const int n = int(rows.size());
++    for (int k = 1; k <= n; ++k) {
++      const int i = ((selected_ + step * k) % n + n) % n;
++      if (Selectable(rows[size_t(i)])) {
++        selected_ = i;
++        return;
++      }
++    }
++  }
++
++  void HandleInput(std::vector<Row>& rows) {
++    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) {
++      tab_ = (tab_ + (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) ? 1 : kTabCount - 1)) % kTabCount;
++      selected_ = -1;
++      first_ = 0;
++      jump_ = true;
++      rows = BuildRows(tab_);
++    }
++    if (selected_ < 0 || selected_ >= int(rows.size()) || !Selectable(rows[size_t(selected_)])) {
++      selected_ = -1;
++      MoveSelection(rows, 1);
++    }
++    if (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
++      Close();
++      return;
++    }
++    if (selected_ < 0) return;
++    if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown, true)) MoveSelection(rows, 1);
++    if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp, true)) MoveSelection(rows, -1);
++    Row& row = rows[size_t(selected_)];
++    const bool left = ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, true);
++    const bool right = ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, true);
++    const bool cross = ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false);
++    switch (row.kind) {
++      case Row::Kind::kChoice: {
++        const int n = int(row.options.size());
++        const int step = left ? -1 : (right || cross) ? 1 : 0;
++        if (step && n) {
++          row.set(((row.get() + step) % n + n) % n);
++          nudge_ = float(step);
++          dirty_ = true;
++        }
++        break;
++      }
++      case Row::Kind::kSwitch:
++        if (cross || left || right) {
++          const int v = left ? 0 : right ? 1 : !row.get();
++          if (v != row.get()) {
++            row.set(v);
++            dirty_ = true;
++          }
++        }
++        break;
++      case Row::Kind::kAction:
++        if (cross && row.run) row.run();
++        break;
++      case Row::Kind::kInfo:
++      case Row::Kind::kEntry:
++        break;
++    }
++  }
++
++  void DrawMenu(ImGuiIO& io, float dt) {
++    std::vector<Row> rows = BuildRows(tab_);
++    if (phase_ == Phase::kOpen || phase_ == Phase::kOpening) HandleInput(rows);
++
++    // A full-screen window that holds the navigation focus (the game's pad stays neutral) and is drawn into.
++    ImGui::SetNextWindowFocus();
++    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
++    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
++    ImGui::Begin("##vig8-quick-menu", nullptr,
++                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
++                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollWithMouse);
++    ImDrawList* draw = ImGui::GetWindowDrawList();
++    const float u = io.DisplaySize.y / 720.0f;
++    const float t = EaseOut(open_);
++    const float W = std::min(io.DisplaySize.x * 0.46f, 520.0f * u);
++    const float x0 = -W * (1.0f - t);
++    const float H = io.DisplaySize.y;
++    const float pad = 46.0f * u;
++
++    // The game behind: dimmed, darker towards the panel.
++    draw->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, int(110 * t)));
++    draw->AddRectFilledMultiColor(ImVec2(x0 + W, 0), ImVec2(x0 + W + 260.0f * u, H), IM_COL32(0, 0, 0, int(150 * t)),
++                                  IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, int(150 * t)));
++    // The panel and its edge.
++    draw->AddRectFilled(ImVec2(x0, 0), ImVec2(x0 + W, H), WithAlpha(kPanel, std::max(t, 0.6f)));
++    draw->AddRectFilledMultiColor(ImVec2(x0, 0), ImVec2(x0 + W, 220.0f * u), AccentAlpha(30), AccentAlpha(0),
++                                  AccentAlpha(0), AccentAlpha(0));
++    draw->AddRectFilled(ImVec2(x0 + W - 2.0f * u, 0), ImVec2(x0 + W, H), kAccent);
++
++    // Title.
++    float y = 44.0f * u;
++    Text(draw, g_fonts.title, ImVec2(x0 + pad, y), kText, "VIGILANTE 8");
++    y += g_fonts.title->LegacySize * u + 6.0f * u;
++    draw->AddRectFilled(ImVec2(x0 + pad, y), ImVec2(x0 + pad + 54.0f * u, y + 3.0f * u), kAccent);
++    const std::string subtitle = fmt::format("ARCADE  ·  PS4  ·  QUICK MENU  ·  v{}", VIG8_VERSION);
++    Text(draw, g_fonts.small, ImVec2(x0 + pad + 66.0f * u, y - 6.0f * u), kDim, subtitle.c_str());
++    y += 34.0f * u;
++
++    // Tabs.
++    const float cap_h = 20.0f * u;
++    float tx = x0 + pad;
++    tx += DrawKeyCap(draw, "L1", ImVec2(tx, y), cap_h, 1.0f) + 14.0f * u;
++    for (int i = 0; i < kTabCount; ++i) {
++      const ImVec2 size = TextSize(g_fonts.tab, kTabs[i]);
++      const float ty = y + (cap_h - size.y) * 0.5f;
++      Text(draw, g_fonts.tab, ImVec2(tx, ty), i == tab_ ? kText : kFaint, kTabs[i]);
++      if (i == tab_) {
++        draw->AddRectFilled(ImVec2(tx, ty + size.y + 5.0f * u), ImVec2(tx + size.x, ty + size.y + 7.5f * u), kAccent);
++      }
++      tx += size.x + 20.0f * u;
++    }
++    DrawKeyCap(draw, "R1", ImVec2(tx - 6.0f * u, y), cap_h, 1.0f);
++    y += cap_h + 26.0f * u;
++    draw->AddLine(ImVec2(x0 + pad, y), ImVec2(x0 + W - pad, y), kLine, 1.0f);
++    y += 10.0f * u;
++
++    // Rows: as many as fit above the description and the hints; the list scrolls with the selection.
++    const float row_h = 54.0f * u;
++    const float rows_top = y;
++    const int visible = std::max(3, int((H - 44.0f * u - 16.0f * u - 120.0f * u - rows_top) / row_h));
++    if (selected_ >= 0) {
++      if (selected_ < first_) first_ = selected_;
++      if (selected_ >= first_ + visible) first_ = selected_ - visible + 1;
++    }
++    first_ = std::clamp(first_, 0, std::max(0, int(rows.size()) - visible));
++    if (selected_ >= 0) {
++      const float target = rows_top + float(selected_ - first_) * row_h;
++      highlight_y_ = highlight_y_ < 0.0f || jump_
++                         ? target
++                         : highlight_y_ + (target - highlight_y_) * std::min(1.0f, dt * 18.0f);
++    }
++    jump_ = false;
++    if (selected_ >= 0) {
++      const float hy = highlight_y_;
++      draw->AddRectFilledMultiColor(ImVec2(x0, hy), ImVec2(x0 + W - 2.0f * u, hy + row_h), AccentAlpha(70),
++                                    AccentAlpha(8), AccentAlpha(8), AccentAlpha(70));
++      draw->AddRectFilled(ImVec2(x0, hy), ImVec2(x0 + 4.0f * u, hy + row_h), kAccent);
++    }
++    nudge_ *= std::max(0.0f, 1.0f - dt * 12.0f);
++    for (size_t i = 0; i < rows.size(); ++i) {
++      if (int(i) < first_ || int(i) >= first_ + visible) continue;
++      const Row& row = rows[i];
++      const bool sel = int(i) == selected_;
++      const float ry = rows_top + float(int(i) - first_) * row_h;
++      const float mid = ry + row_h * 0.5f;
++      const ImVec2 lsize = TextSize(g_fonts.row, row.label.c_str());
++      float lx = x0 + pad;
++      if (row.kind == Row::Kind::kEntry && row.trophy) {
++        DrawTrophy(draw, ImVec2(lx + 9.0f * u, mid), 9.0f * u, row.earned ? row.trophy : kFaint);
++        lx += 28.0f * u;
++      }
++      const ImU32 lc = sel                                            ? kText
++                       : row.kind == Row::Kind::kInfo                  ? kDim
++                       : row.kind == Row::Kind::kEntry && !row.earned ? kDim
++                                                                       : IM_COL32(204, 200, 196, 255);
++      Text(draw, g_fonts.row, ImVec2(lx, mid - lsize.y * 0.5f), lc, row.label.c_str());
++      if (i + 1 < rows.size() && int(i) + 1 < first_ + visible) {
++        draw->AddLine(ImVec2(x0 + pad, ry + row_h), ImVec2(x0 + W - pad, ry + row_h), kLine, 1.0f);
++      }
++      const float right = x0 + W - pad;
++      switch (row.kind) {
++        case Row::Kind::kChoice: {
++          const int v = std::clamp(row.get(), 0, int(row.options.size()) - 1);
++          const char* value = row.options[size_t(v)].c_str();
++          const ImVec2 vs = TextSize(g_fonts.value, value);
++          const float arrow = 5.0f * u;
++          const float shift = sel ? nudge_ * 4.0f * u : 0.0f;
++          const float vx = right - arrow * 2.0f - 12.0f * u - vs.x + shift;
++          Text(draw, g_fonts.value, ImVec2(vx, mid - vs.y * 0.5f), sel ? kText : kDim, value);
++          if (sel) {
++            const ImU32 c = kAccent;
++            const float lx = vx - 12.0f * u - shift;
++            draw->AddTriangleFilled(ImVec2(lx - arrow, mid), ImVec2(lx + arrow * 0.4f, mid - arrow),
++                                    ImVec2(lx + arrow * 0.4f, mid + arrow), c);
++            const float rx = right - arrow;
++            draw->AddTriangleFilled(ImVec2(rx + arrow, mid), ImVec2(rx - arrow * 0.4f, mid + arrow),
++                                    ImVec2(rx - arrow * 0.4f, mid - arrow), c);
++          }
++          // The position among the options: small marks under the value.
++          const float dots_w = float(row.options.size()) * 9.0f * u;
++          float dx = right - arrow * 2.0f - 12.0f * u - dots_w + 3.0f * u;
++          for (size_t k = 0; k < row.options.size(); ++k, dx += 9.0f * u) {
++            draw->AddRectFilled(ImVec2(dx, mid + vs.y * 0.5f + 4.0f * u),
++                                ImVec2(dx + 6.0f * u, mid + vs.y * 0.5f + 6.0f * u),
++                                int(k) == v ? (sel ? kAccent : kDim) : kFaint);
++          }
++          break;
++        }
++        case Row::Kind::kSwitch: {
++          const bool on = row.get() != 0;
++          const float sw = 46.0f * u, sh = 24.0f * u;
++          const ImVec2 a(right - sw, mid - sh * 0.5f), b(right, mid + sh * 0.5f);
++          draw->AddRectFilled(a, b, on ? kAccent : IM_COL32(60, 58, 56, 255), sh * 0.5f);
++          const float kx = on ? b.x - sh * 0.5f : a.x + sh * 0.5f;
++          draw->AddCircleFilled(ImVec2(kx, mid), sh * 0.5f - 3.0f * u, on ? kText : IM_COL32(172, 170, 168, 255), 24);
++          const char* state = on ? "ON" : "OFF";
++          const ImVec2 ss = TextSize(g_fonts.small, state);
++          Text(draw, g_fonts.small, ImVec2(a.x - 10.0f * u - ss.x, mid - ss.y * 0.5f), sel ? kText : kDim, state);
++          break;
++        }
++        case Row::Kind::kAction: {
++          const char* label = "START";
++          const ImVec2 ls = TextSize(g_fonts.small, label);
++          const float bw = ls.x + 40.0f * u, bh = 26.0f * u;
++          const ImVec2 a(right - bw, mid - bh * 0.5f), b(right, mid + bh * 0.5f);
++          if (sel) draw->AddRectFilled(a, b, kAccent, 3.0f * u);
++          draw->AddRect(a, b, sel ? kAccent : kFaint, 3.0f * u, 0, 1.3f);
++          DrawMark(draw, Mark::kCross, ImVec2(a.x + 13.0f * u, mid), 6.5f * u, 1.0f);
++          Text(draw, g_fonts.small, ImVec2(a.x + 25.0f * u, mid - ls.y * 0.5f), kText, label);
++          break;
++        }
++        case Row::Kind::kInfo:
++        case Row::Kind::kEntry: {
++          const ImVec2 is = TextSize(g_fonts.body, row.info.c_str());
++          const ImU32 vc = row.kind == Row::Kind::kEntry ? (row.earned ? kGood : kDim) : kText;
++          Text(draw, g_fonts.body, ImVec2(right - is.x, mid - is.y * 0.5f), vc, row.info.c_str());
++          break;
++        }
++      }
++    }
++    if (int(rows.size()) > visible) {  // where the list is
++      const std::string where =
++          fmt::format("{}-{} of {}", first_ + 1, std::min(int(rows.size()), first_ + visible), rows.size());
++      const ImVec2 ws = TextSize(g_fonts.small, where.c_str());
++      Text(draw, g_fonts.small, ImVec2(x0 + W - pad - ws.x, rows_top - ws.y - 4.0f * u), kFaint, where.c_str());
++    }
++    y = rows_top + float(std::min(int(rows.size()), visible)) * row_h + 26.0f * u;
++
++    // The selected row's description.
++    if (selected_ >= 0 && selected_ < int(rows.size())) {
++      const Row& row = rows[size_t(selected_)];
++      if (row.restart) {
++        const char* tag = "NEXT START";
++        const ImVec2 ts = TextSize(g_fonts.small, tag);
++        draw->AddRectFilled(ImVec2(x0 + pad, y), ImVec2(x0 + pad + ts.x + 14.0f * u, y + ts.y + 6.0f * u), kAmber,
++                            3.0f * u);
++        Text(draw, g_fonts.small, ImVec2(x0 + pad + 7.0f * u, y + 3.0f * u), IM_COL32(20, 16, 8, 255), tag);
++        Text(draw, g_fonts.small, ImVec2(x0 + pad + ts.x + 24.0f * u, y + 3.0f * u), kAmber,
++             "applies when the game is started again");
++        y += ts.y + 16.0f * u;
++      }
++      Text(draw, g_fonts.body, ImVec2(x0 + pad, y), kDim, row.help.c_str(), W - pad * 2.0f);
++    } else if (tab_ == kAboutTab) {
++      Text(draw, g_fonts.body, ImVec2(x0 + pad, y), kDim,
++           "A port of sp00nznet/vig8 done the MP3 and MGR way: the game's code converted to x86-64 ahead of time, "
++           "its graphics drawn by the Xenos emulation on the PS4's GPU. Your game data stays on your console.",
++           W - pad * 2.0f);
++    }
++
++    // The buttons' hints.
++    const float fy = H - 44.0f * u;
++    draw->AddLine(ImVec2(x0 + pad, fy - 16.0f * u), ImVec2(x0 + W - pad, fy - 16.0f * u), kLine, 1.0f);
++    float hx = x0 + pad;
++    const float r = 8.0f * u;
++    auto hint = [&](Mark mark, const char* label) {
++      hx += DrawMark(draw, mark, ImVec2(hx + r, fy + r), r, 1.0f) + 7.0f * u;
++      const ImVec2 s = TextSize(g_fonts.body, label);
++      Text(draw, g_fonts.body, ImVec2(hx, fy + r - s.y * 0.5f), kDim, label);
++      hx += s.x + 22.0f * u;
++    };
++    if (selected_ >= 0) {
++      hint(Mark::kDpadVertical, "Move");
++      const Row::Kind kind = rows[size_t(selected_)].kind;
++      if (kind == Row::Kind::kChoice) hint(Mark::kDpadHorizontal, "Change");
++      if (kind == Row::Kind::kSwitch) hint(Mark::kCross, "Switch");
++      if (kind == Row::Kind::kAction) hint(Mark::kCross, "Start");
++    }
++    hint(Mark::kCircle, "Close");
++    const char* combo = "L3 + R3";
++    const ImVec2 cs = TextSize(g_fonts.small, combo);
++    Text(draw, g_fonts.small, ImVec2(x0 + W - pad - cs.x, fy + r - cs.y * 0.5f), kFaint, combo);
++
++    ImGui::End();
++  }
++
++  void DrawCounter(ImGuiIO& io, bool menu_visible) {
++    const int32_t mode = REXCVAR_GET(vig8_frame_counter);
++    const bool profiling = ps4_profile_running() != 0;
++    if (mode <= 0 && !profiling) return;
++    const bool right_corner = REXCVAR_GET(vig8_frame_counter_corner) == 1;
++    if (menu_visible && !right_corner) return;  // under the panel
++    ImDrawList* draw = ImGui::GetForegroundDrawList();
++    const float u = io.DisplaySize.y / 720.0f;
++    const FrameStats stats = ReadStats(120);
++    const float margin = 18.0f * u, padx = 12.0f * u, pady = 8.0f * u;
++
++    char fps_text[16];
++    std::snprintf(fps_text, sizeof(fps_text), "%.0f", stats.fps);
++    const ImVec2 fs = TextSize(g_fonts.counter, fps_text);
++    const ImVec2 ls = TextSize(g_fonts.small, "FPS");
++    float w = fs.x + ls.x + padx * 2.0f + 6.0f * u + 14.0f * u;
++    float h = fs.y + pady * 2.0f;
++    std::string detail;
++    const float graph_h = 40.0f * u;
++    if (mode >= 2) {
++      detail = fmt::format("{:.1f} ms  ·  worst {:.1f} ms", stats.frame_ms, stats.worst_ms);
++      w = std::max(w, TextSize(g_fonts.small, detail.c_str()).x + padx * 2.0f);
++      w = std::max(w, 200.0f * u);
++      h += TextSize(g_fonts.small, detail.c_str()).y + 6.0f * u + graph_h + 8.0f * u;
++    }
++    if (profiling) h += 20.0f * u;
++    const float x = right_corner ? io.DisplaySize.x - margin - w : margin;
++    const float y = margin;
++    draw->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(8, 8, 10, 190), 6.0f * u);
++    draw->AddRectFilled(ImVec2(x, y + 6.0f * u), ImVec2(x + 3.0f * u, y + h - 6.0f * u), FpsColour(stats.fps));
++
++    float cy = y + pady;
++    draw->AddCircleFilled(ImVec2(x + padx + 4.0f * u, cy + fs.y * 0.5f), 4.0f * u, FpsColour(stats.fps), 16);
++    Text(draw, g_fonts.counter, ImVec2(x + padx + 14.0f * u, cy), kText, fps_text);
++    Text(draw, g_fonts.small, ImVec2(x + padx + 14.0f * u + fs.x + 6.0f * u, cy + fs.y - ls.y - 3.0f * u), kDim, "FPS");
++    cy += fs.y + 4.0f * u;
++    if (mode >= 2) {
++      Text(draw, g_fonts.small, ImVec2(x + padx, cy), kDim, detail.c_str());
++      cy += TextSize(g_fonts.small, detail.c_str()).y + 6.0f * u;
++      // The last frames' times, 0..50 ms, with the 60 and 30 fps lines.
++      const ImVec2 g0(x + padx, cy), g1(x + w - padx, cy + graph_h);
++      draw->AddRectFilled(g0, g1, IM_COL32(255, 255, 255, 10), 2.0f * u);
++      auto line_at = [&](float ms) { return g1.y - (g1.y - g0.y) * std::min(ms, 50.0f) / 50.0f; };
++      draw->AddLine(ImVec2(g0.x, line_at(16.7f)), ImVec2(g1.x, line_at(16.7f)), WithAlpha(kGood, 0.35f), 1.0f);
++      draw->AddLine(ImVec2(g0.x, line_at(33.3f)), ImVec2(g1.x, line_at(33.3f)), WithAlpha(kFair, 0.35f), 1.0f);
++      if (stats.history.size() >= 2) {
++        std::vector<ImVec2> points;
++        points.reserve(stats.history.size());
++        const float step = (g1.x - g0.x) / float(120 - 1);
++        float px = g1.x - step * float(stats.history.size() - 1);
++        for (const float ms : stats.history) {
++          points.emplace_back(px, line_at(ms));
++          px += step;
++        }
++        draw->AddPolyline(points.data(), int(points.size()), kText, ImDrawFlags_None, 1.4f * u);
++      }
++      cy += graph_h + 8.0f * u;
++    }
++    if (profiling) {
++      Text(draw, g_fonts.small, ImVec2(x + padx, cy), kAmber, "Recording a CPU profile");
++    }
++  }
++
++  void DrawToast(ImGuiIO& io, float dt) {
++    if (toast_left_ <= 0.0f) return;
++    toast_left_ -= dt;
++    const float alpha = std::clamp(toast_left_ / 0.4f, 0.0f, 1.0f);
++    ImDrawList* draw = ImGui::GetForegroundDrawList();
++    const float u = io.DisplaySize.y / 720.0f;
++    const char* text = "Settings saved";
++    const ImVec2 s = TextSize(g_fonts.body, text);
++    const float w = s.x + 40.0f * u, h = s.y + 18.0f * u;
++    const ImVec2 a(io.DisplaySize.x - 28.0f * u - w, io.DisplaySize.y - 32.0f * u - h);
++    draw->AddRectFilled(a, ImVec2(a.x + w, a.y + h), WithAlpha(IM_COL32(16, 14, 12, 235), alpha), 5.0f * u);
++    draw->AddRectFilled(a, ImVec2(a.x + 3.0f * u, a.y + h), WithAlpha(kAccent, alpha));
++    draw->AddCircleFilled(ImVec2(a.x + 16.0f * u, a.y + h * 0.5f), 3.5f * u, WithAlpha(kGood, alpha), 12);
++    Text(draw, g_fonts.body, ImVec2(a.x + 28.0f * u, a.y + (h - s.y) * 0.5f), WithAlpha(kText, alpha), text);
++  }
++
++  // The achievement pop-up: slides down at the top centre, 5 s, then the next one.
++  bool PopupActive() const { return !popups_.empty(); }
++  void DrawPopup(ImGuiIO& io, float dt) {
++    if (popups_.empty()) return;
++    constexpr float kShow = 5.0f;
++    popup_t_ += dt;
++    if (popup_t_ >= kShow) {
++      popups_.pop_front();
++      popup_t_ = 0.0f;
++      return;
++    }
++    const auto& p = popups_.front();
++    const float in = std::clamp(popup_t_ / 0.35f, 0.0f, 1.0f), out = std::clamp((kShow - popup_t_) / 0.4f, 0.0f, 1.0f);
++    const float alpha = std::min(in, out);
++    const float u = io.DisplaySize.y / 720.0f;
++    ImDrawList* draw = ImGui::GetForegroundDrawList();
++    const char* head = "ACHIEVEMENT UNLOCKED";
++    const std::string score = fmt::format("{} G", p.gamerscore);
++    const ImVec2 hs = TextSize(g_fonts.small, head), ns = TextSize(g_fonts.row, p.name.c_str()),
++                 ss = TextSize(g_fonts.small, score.c_str());
++    const float icon = 44.0f * u, padx = 16.0f * u;
++    const float w = std::max(320.0f * u, icon + padx * 3.0f + std::max(hs.x + ss.x + 16.0f * u, ns.x));
++    const float h = 66.0f * u;
++    const float x = (io.DisplaySize.x - w) * 0.5f;
++    const float y = 26.0f * u - (1.0f - EaseOut(in)) * (h + 30.0f * u);
++    draw->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), WithAlpha(IM_COL32(16, 13, 11, 238), alpha), 8.0f * u);
++    draw->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), WithAlpha(IM_COL32(255, 255, 255, 28), alpha), 8.0f * u, 0, 1.0f);
++    const ImU32 tier = TierColour(p.gamerscore);
++    const ImVec2 ic(x + padx + icon * 0.5f, y + h * 0.5f);
++    draw->AddCircleFilled(ic, icon * 0.5f, WithAlpha(IM_COL32(255, 255, 255, 14), alpha), 32);
++    draw->AddCircle(ic, icon * 0.5f, WithAlpha(tier, alpha * 0.8f), 32, 1.5f * u);
++    DrawTrophy(draw, ic, icon * 0.27f, WithAlpha(tier, alpha));
++    const float tx = x + padx * 2.0f + icon;
++    Text(draw, g_fonts.small, ImVec2(tx, y + 12.0f * u), WithAlpha(tier, alpha), head);
++    Text(draw, g_fonts.small, ImVec2(x + w - padx - ss.x, y + 12.0f * u), WithAlpha(kDim, alpha), score.c_str());
++    Text(draw, g_fonts.row, ImVec2(tx, y + h - 14.0f * u - ns.y), WithAlpha(kText, alpha), p.name.c_str());
++  }
++
++  struct Popup {
++    std::string name;
++    uint32_t gamerscore = 0;
++  };
++  std::deque<Popup> popups_;
++  float popup_t_ = 0.0f;
++
++  // While the buttons that closed the menu are held: an empty window keeps the navigation focus (so the game's pad
++  // stays neutral) until they are released.
++  void HoldFocus() {
++    ImGui::SetNextWindowPos(ImVec2(-100.0f, -100.0f), ImGuiCond_Always);
++    ImGui::SetNextWindowSize(ImVec2(1.0f, 1.0f), ImGuiCond_Always);
++    ImGui::SetNextWindowFocus();
++    ImGui::Begin("##vig8-menu-release", nullptr,
++                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
++    ImGui::End();
++  }
++
++  Phase phase_ = Phase::kClosed;
++  float open_ = 0.0f;
++  int tab_ = 0;
++  int selected_ = -1;
++  int first_ = 0;  // the first row drawn (the list scrolls)
++  float highlight_y_ = -1.0f;
++  bool jump_ = true;
++  float nudge_ = 0.0f;
++  bool combo_held_ = false;
++  bool dirty_ = false;
++  bool start_profile_ = false;
++  float toast_left_ = 0.0f;
++};
++
++// The High Octane Pack, in the package's installed-content layout (scripts/dlc-layout.py) or not.
++std::string DlcText() {
++  std::error_code ec;
++  const std::string root = rex::cvar::Query<std::string>("content_marketplace_root");
++  if (root.empty()) return "none installed";
++  const std::filesystem::path folder = std::filesystem::path(root) / "0000000000000000" / "584108A8" / "00000002";
++  size_t packs = 0;
++  for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
++    if (entry.is_directory(ec)) ++packs;
++  }
++  return packs ? "High Octane Pack (in the package)" : "none installed";
++}
++
++// UI thread: the dialog for the menu (made when it is first needed).
++QuickMenu& Dialog() {
++  if (!g_state.dialog) g_state.dialog = new QuickMenu(g_state.drawer);
++  return *g_state.dialog;
++}
++
++void Open(int tab) {
++  if (!g_state.drawer) return;
++  Dialog().Show(tab);
++  g_animating = true;
++  g_state.drawer->RequestRepaint();
++}
++
++// The dialog cannot delete itself inside its own Draw: after it, on the UI thread.
++void ReleaseLater() {
++  static bool pending = false;
++  if (pending || !g_state.context) return;
++  pending = true;
++  g_state.context->CallInUIThreadDeferred([] {
++    pending = false;
++    if (g_state.dialog && g_state.dialog->Idle()) {
++      delete g_state.dialog;
++      g_state.dialog = nullptr;
++    }
++  });
++}
++
++void StartRepaintTicker() {
++  std::thread([] {
++    for (;;) {
++      if (g_animating.load(std::memory_order_relaxed) && g_state.context) {
++        g_state.context->CallInUIThread([] {
++          if (g_state.drawer && g_state.dialog) g_state.drawer->RequestRepaint();
++        });
++        std::this_thread::sleep_for(std::chrono::microseconds(16667));
++      } else {
++        std::this_thread::sleep_for(std::chrono::milliseconds(30));
++      }
++    }
++  }).detach();
++}
++
++}  // namespace
++
++void ShowAchievement(const std::string& name, uint32_t gamerscore) {
++  if (!g_state.context) return;
++  g_state.context->CallInUIThreadDeferred([name, gamerscore] {
++    if (!g_state.drawer) return;
++    Dialog().PushAchievement(name, gamerscore);
++    g_animating = true;
++    g_state.drawer->RequestRepaint();
++  });
++}
++
++void ShowAchievementsList() {
++  REXLOG_INFO("[menu] the game asked for its achievements list (XamShowAchievementsUI)");
++  if (g_state.context && g_state.drawer) g_state.context->CallInUIThread([] { Open(kAchievementsTab); });
++}
++
++std::string ConsoleText() {
++  const unsigned mhz = ps4_kit_cpu_mhz();
++  if (sceKernelHasNeoMode() == 1) {
++    return mhz >= 2000 ? "PS4 Pro, Boost Mode on"
++                       : "PS4 Pro, Boost Mode off: Settings > System > Boost Mode gives 2.13 GHz";
++  }
++  return "PS4";
++}
++
++void AddFonts(ImFontAtlas* atlas) {
++  static const ImWchar kLatin[] = {0x0020, 0x00FF, 0x2013, 0x2014, 0x2022, 0x2022, 0x2026, 0x2026, 0};
++  static const ImWchar kCapitals[] = {0x0020, 0x005A, 0};
++  g_fonts.title = AddLato(atlas, kLatoBlack, sizeof(kLatoBlack), 40.0f, kCapitals);
++  g_fonts.tab = AddLato(atlas, kLatoBlack, sizeof(kLatoBlack), 15.0f, kLatin);
++  g_fonts.row = AddLato(atlas, kLatoRegular, sizeof(kLatoRegular), 18.0f, kLatin);
++  g_fonts.value = AddLato(atlas, kLatoBlack, sizeof(kLatoBlack), 16.0f, kLatin);
++  g_fonts.body = AddLato(atlas, kLatoRegular, sizeof(kLatoRegular), 14.0f, kLatin);
++  g_fonts.counter = AddLato(atlas, kLatoBlack, sizeof(kLatoBlack), 26.0f, kLatin);
++  g_fonts.small = AddLato(atlas, kLatoRegular, sizeof(kLatoRegular), 12.0f, kLatin);
++  if (!g_fonts.title || !g_fonts.tab || !g_fonts.row || !g_fonts.value || !g_fonts.body || !g_fonts.counter ||
++      !g_fonts.small) {
++    REXLOG_ERROR("[menu] the Lato fonts could not be loaded");
++  }
++}
++
++void Attach(rex::ui::WindowedAppContext& context, rex::ui::ImGuiDrawer* drawer, std::filesystem::path config) {
++  g_state.context = &context;
++  g_state.drawer = drawer;
++  g_state.config = std::move(config);
++  if (!g_fonts.row) {
++    REXLOG_WARN("[menu] no fonts: the quick menu is off");
++    g_state.drawer = nullptr;
++    return;
++  }
++  drawer->SetContinuousRepaint(false);
++  StartRepaintTicker();
++  if (REXCVAR_GET(vig8_frame_counter) > 0) Dialog();
++  REXLOG_INFO("[menu] L3+R3 opens the quick menu (settings saved to {})", g_state.config.string());
++}
++
++std::string StatsText() {
++  const FrameStats stats = ReadStats(0);
++  return fmt::format("{:.1f} fps, {:.1f} ms a frame (worst {:.1f} ms in the last second), {} swaps so far", stats.fps,
++                     stats.frame_ms, stats.worst_ms, g_swaps.load(std::memory_order_acquire));
++}
++
++// v00.07: the SDK's GPU census (vulkan/command_processor.cpp): every draw's render targets and textures and every
++// resolve counted by kind for a few frames - which passes a slow frame's draws belong to.
++extern "C" void rex_gpu_census_start(uint32_t frames);
++extern "C" size_t rex_gpu_census_text(char* out, size_t size);
++
++namespace {
++// v00.09: started together with the automatic profile, in the slow view itself (v00.07-v00.08 waited for the profile
++// to end, and the view had often changed by then; the census costs ~3 frames of the 8 s profile): 3 frames, written
++// to <data>/profiles/census_<n>.txt.
++enum class CensusState { kIdle, kRunning, kDone };
++CensusState g_census_state = CensusState::kIdle;
++
++void StartCensus() {
++  if (g_census_state != CensusState::kIdle) return;
++  rex_gpu_census_start(3);
++  g_census_state = CensusState::kRunning;
++  REXLOG_INFO("[menu] GPU census of 3 frames started (with the automatic profile)");
++}
++
++void PollCensus() {
++  static uint32_t polls = 0;
++  CensusState& state = g_census_state;
++  if (state != CensusState::kRunning) return;
++  const size_t size = rex_gpu_census_text(nullptr, 0);
++  if (!size) {
++    if (++polls > 600) {  // 600 swaps without a result: give up
++      state = CensusState::kDone;
++      REXLOG_WARN("[menu] GPU census gave nothing");
++    }
++    return;
++  }
++  state = CensusState::kDone;
++  std::string text(size + 1, '\0');
++  text.resize(rex_gpu_census_text(text.data(), text.size()));
++  std::error_code ec;
++  const std::filesystem::path dir = g_state.config.parent_path() / "profiles";
++  std::filesystem::create_directories(dir, ec);
++  std::filesystem::path out;
++  for (int i = 1; i < 100; ++i) {
++    out = dir / fmt::format("census_{}.txt", i);
++    if (!std::filesystem::exists(out, ec)) break;
++  }
++  if (FILE* f = std::fopen(out.c_str(), "wb")) {
++    std::fwrite(text.data(), 1, text.size(), f);
++    std::fclose(f);
++    REXLOG_INFO("[menu] GPU census written to {} ({} bytes)", out.string(), text.size());
++  } else {
++    REXLOG_WARN("[menu] GPU census: {} not writable", out.string());
++  }
++}
++}  // namespace
++
++void NoteSwap() {
++  const uint32_t n = g_swaps.load(std::memory_order_relaxed);
++  const uint64_t now = NowNs();
++  g_swap_ns[n % kRing].store(now, std::memory_order_relaxed);
++  g_swaps.store(n + 1, std::memory_order_release);  // one writer: the game's swapping thread
++  // vig8_auto_profile: seconds in a row under vig8_auto_profile_fps swaps, checked once a second.
++  static uint64_t second_start = 0, slow_since = 0;
++  static uint32_t second_swaps = 0;
++  static bool profiled = false;
++  ++second_swaps;
++  if (!second_start) second_start = now;
++  if (now - second_start >= 1'000'000'000ull) {
++    const bool slow = second_swaps < uint32_t(REXCVAR_GET(vig8_auto_profile_fps));
++    second_swaps = 0;
++    second_start = now;
++    if (!slow) {
++      slow_since = 0;
++    } else if (!slow_since) {
++      slow_since = now;
++    } else if (!profiled && REXCVAR_GET(vig8_auto_profile) &&
++               now - slow_since >= uint64_t(REXCVAR_GET(vig8_auto_profile_s)) * 1'000'000'000ull &&
++               ps4_profile_running() == 0) {
++      profiled = true;
++      ps4_profile_set_enabled(1);
++      static char label[64];
++      snprintf(label, sizeof(label), "auto: under %d fps for %d s", REXCVAR_GET(vig8_auto_profile_fps),
++               REXCVAR_GET(vig8_auto_profile_s));
++      const bool started = ps4_profile_start(kProfileSeconds, label);
++      REXLOG_INFO("[menu] {}: CPU profile of {:.0f} s {}", label + 6, kProfileSeconds,
++                  started ? "started (vig8_auto_profile)" : "not started");
++      StartCensus();
++    }
++  }
++  PollCensus();
++  if (rex::input::ps4::PS4InputDriver::TakeMenuCombo()) {
++    if (g_menu_owns_combo.load() || NowNs() < g_combo_quiet_until_ns.load()) return;
++    if (g_state.context && g_state.drawer) g_state.context->CallInUIThread([] { Open(); });
++  }
++}
++
++}  // namespace vig8::menu
+diff --git a/project/ps4/vig8_ps4_menu.h b/project/ps4/vig8_ps4_menu.h
+new file mode 100644
+index 0000000..6a43661
+--- /dev/null
++++ b/project/ps4/vig8_ps4_menu.h
+@@ -0,0 +1,40 @@
++// vig8-ps4 - the L3+R3 quick menu and the frame counter (vig8_ps4_menu.cpp).
++
++#pragma once
++
++#include <cstdint>
++#include <filesystem>
++#include <string>
++
++struct ImFontAtlas;
++
++namespace rex::ui {
++class ImGuiDrawer;
++class WindowedAppContext;
++}  // namespace rex::ui
++
++namespace vig8::menu {
++
++// ReXApp::OnConfigureFonts: the menu's typefaces (Lato), baked at the sizes it draws with.
++void AddFonts(ImFontAtlas* atlas);
++
++// ReXApp::OnCreateDialogs, on the UI thread: from here L3+R3 opens the menu. Its settings are saved to 'config'.
++void Attach(rex::ui::WindowedAppContext& context, rex::ui::ImGuiDrawer* drawer, std::filesystem::path config);
++
++// At each of the game's swaps (VdSwap, the game's thread): a frame for the counter, and L3+R3.
++void NoteSwap();
++
++// An achievement's unlock pop-up (any thread; queued, shown one after another).
++void ShowAchievement(const std::string& name, uint32_t gamerscore);
++
++// The game's own "Achievements" menu item (XamShowAchievementsUI, on the game's thread): the quick menu opens on its
++// ACHIEVEMENTS tab.
++void ShowAchievementsList();
++
++// The frame rate and the last second's frame times, as one line.
++std::string StatsText();
++
++// What kind of PS4 this is and its CPU clock, for the log and the ABOUT tab ("PS4 Pro, Boost Mode on").
++std::string ConsoleText();
++
++}  // namespace vig8::menu
+diff --git a/project/tools/make_ps4_pch.py b/project/tools/make_ps4_pch.py
+new file mode 100644
+index 0000000..ed5d6f9
+--- /dev/null
++++ b/project/tools/make_ps4_pch.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""Make the PS4 PCH for Vigilante 8's generated code (project/ps4/CMakeLists.txt, through prepare_tree.py).
++
++generated/default/vig8_pch.h is rendered by the host code generator (ReXGlue v0.10.0). The PS4 build compiles it
++against MP3's PS4 SDK, and needs, as MP3's port does (mp3-nx tools/make_nx_pch.py + make_ps4_pch.py, merged here):
++
++  1. The interrupt locks per thread (make_nx_pch.py point 3). Guest code brackets its lwarx/stwcx. sequences with
++     mtmsrd (interrupts off); the codegen makes each region one process-wide recursive mutex. The atomic inside is
++     already a host compare-and-swap, so the "interrupts off" state is per thread (what mfmsr reads back);
++     ppc_msr_cerrojo_global_() brings the old global mutex back (cvar vig8_msr_global_lock).
++  2. REX_RAW_ADDR_W, in case a pass writes it.
++  3. Guest stack accesses without volatile: REX_SLOAD_* / REX_SSTORE_* (tools/patch_stack_access.py).
++  4. REX_PHYS_HOST_OFFSET for the PS4: the 0xE0000000 heap sits 4 KiB further in host memory there (64 KiB
++     allocation granularity, as on Windows; sdk/src/core/memory_ps4.cpp). v0.10.0's template gives the offset only to
++     Windows and arm64 macOS: without it every access to that heap reads the wrong page (the MGR port's v00.03 crash).
++  5. REX_VMADDFP / REX_VNMSUBFP (tools/patch_vmx_exact.py) and REX_FMA (tools/ps4_unfused_fma.py) as a multiply and
++     an add: the Jaguar has no FMA unit, so a fused form would be libm's software fma.
++  6. REX_LOAD_U32_B(base_register, displacement) ..., for MP3's patch_phys_base.py, should it be used.
++  7. An include guard around everything (cmake_pch.hxx includes the header again after the PCH).
++
++Usage: make_ps4_pch.py <generated/default/vig8_pch.h> <out.h>
++"""
++import sys
++
++src, dst = sys.argv[1], sys.argv[2]
++text = open(src, encoding="utf-8").read()
++GUARD = "VIG8_PS4_PCH_H"
++
++# 1. The interrupt locks.
++OLD_LOCKS_START = "#define REX_CHECK_GLOBAL_LOCK()"
++OLD_LOCKS_END = "rex::thread::global_critical_region::mutex().unlock();                                \\\n  } while (0)\n"
++i = text.find(OLD_LOCKS_START)
++j = text.find(OLD_LOCKS_END, i)
++if i < 0 or j < 0 or text.count(OLD_LOCKS_START) != 1:
++    sys.exit("interrupt lock macros not found exactly once")
++j += len(OLD_LOCKS_END)
++NEW_LOCKS = """// PS4 (make_ps4_pch.py, 1): the interrupt locks per thread unless ppc_msr_cerrojo_global_().
++inline bool& ppc_msr_cerrojo_global_() {
++  static bool global = false;
++  return global;
++}
++
++inline i32& ppc_msr_profundidad_() {
++  static thread_local i32 profundidad = 0;
++  return profundidad;
++}
++
++#define REX_CHECK_GLOBAL_LOCK()                                          \\
++  (ppc_msr_cerrojo_global_() ? ([&]() -> u64 {                           \\
++    auto lock_ = rex::thread::global_critical_region::AcquireDirect();   \\
++    return ppc_global_lock_count_().load() ? 0 : 0x8000;                 \\
++  }())                                                                   \\
++                             : (ppc_msr_profundidad_() ? u64(0) : u64(0x8000)))
++
++#define REX_ENTER_GLOBAL_LOCK()                              \\
++  do {                                                       \\
++    if (ppc_msr_cerrojo_global_()) {                         \\
++      rex::thread::global_critical_region::mutex().lock();   \\
++      ppc_global_lock_count_().fetch_add(1);                 \\
++    } else {                                                 \\
++      ++ppc_msr_profundidad_();                              \\
++    }                                                        \\
++  } while (0)
++
++#define REX_LEAVE_GLOBAL_LOCK()                              \\
++  do {                                                       \\
++    if (ppc_msr_cerrojo_global_()) {                         \\
++      ppc_global_lock_count_().fetch_sub(1);                 \\
++      rex::thread::global_critical_region::mutex().unlock(); \\
++    } else {                                                 \\
++      --ppc_msr_profundidad_();                              \\
++    }                                                        \\
++  } while (0)
++"""
++text = text[:i] + NEW_LOCKS + text[j:]
++
++# 2. REX_RAW_ADDR_W.
++if "REX_RAW_ADDR_W" not in text:
++    text = text.rstrip() + """
++
++// PS4 (make_ps4_pch.py, 2): stores written as REX_RAW_ADDR_W by some passes.
++#ifndef REX_RAW_ADDR_W
++#define REX_RAW_ADDR_W(x, n) REX_RAW_ADDR(x)
++#endif
++"""
++
++# 3. Guest stack accesses (r1), without volatile.
++if "REX_SLOAD_U32" not in text:
++    text = text.rstrip() + """
++
++// PS4 (make_ps4_pch.py, 3): guest stack accesses (r1), without volatile.
++#define REX_SLOAD_U8(x) ({ u8 rex_sv_; __builtin_memcpy(&rex_sv_, base + (u32)(x), 1); rex_sv_; })
++#define REX_SLOAD_U16(x) ({ u16 rex_sv_; __builtin_memcpy(&rex_sv_, base + (u32)(x), 2); __builtin_bswap16(rex_sv_); })
++#define REX_SLOAD_U32(x) ({ u32 rex_sv_; __builtin_memcpy(&rex_sv_, base + (u32)(x), 4); __builtin_bswap32(rex_sv_); })
++#define REX_SLOAD_U64(x) ({ u64 rex_sv_; __builtin_memcpy(&rex_sv_, base + (u32)(x), 8); __builtin_bswap64(rex_sv_); })
++#define REX_SSTORE_U8(x, y) ({ u8 rex_sv_ = (u8)(y); __builtin_memcpy(base + (u32)(x), &rex_sv_, 1); })
++#define REX_SSTORE_U16(x, y) ({ u16 rex_sv_ = __builtin_bswap16(y); __builtin_memcpy(base + (u32)(x), &rex_sv_, 2); })
++#define REX_SSTORE_U32(x, y) ({ u32 rex_sv_ = __builtin_bswap32(y); __builtin_memcpy(base + (u32)(x), &rex_sv_, 4); })
++#define REX_SSTORE_U64(x, y) ({ u64 rex_sv_ = __builtin_bswap64(y); __builtin_memcpy(base + (u32)(x), &rex_sv_, 8); })
++"""
++
++# 4. The physical heap's host offset.
++OFFSET = "#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)\n#define REX_PHYS_HOST_OFFSET"
++if text.count(OFFSET) != 1:
++    sys.exit("REX_PHYS_HOST_OFFSET condition not found exactly once")
++text = text.replace(OFFSET, "#if REX_PLATFORM_WIN32 || REX_PLATFORM_PS4 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)\n"
++                            "#define REX_PHYS_HOST_OFFSET")
++
++# 5. vmaddfp / vnmsubfp and the fmadd family unfused.
++if "REX_VMADDFP" not in text:
++    text = text.rstrip() + """
++
++// PS4 (make_ps4_pch.py, 5): the Jaguar has no FMA unit, so a multiply and an add (one rounding more than the console).
++#include <simde/x86/sse.h>
++#define REX_VMADDFP(a, b, c) simde_mm_add_ps(simde_mm_mul_ps((a), (b)), (c))
++#define REX_VNMSUBFP(a, b, c) simde_mm_sub_ps((c), simde_mm_mul_ps((a), (b)))
++#if defined(__FMA__)
++#define REX_FMA(a, b, c) std::fma((a), (b), (c))
++#else
++#define REX_FMA(a, b, c) ((a) * (b) + (c))
++#endif
++"""
++
++# 6. Register + displacement accesses with the heap offset from the base register.
++if "REX_LOAD_U32_B" not in text:
++    text = text.rstrip() + """
++
++// PS4 (make_ps4_pch.py, 6): a register + displacement access takes the 0xE0000000 heap's host offset from its base
++// register (MP3's tools/patch_phys_base.py), so the compiler checks a pointer once for all its accesses.
++#define REX_LOAD_U8_B(b, d) (*(volatile u8*)(base + (u32)((b) + (d)) + REX_PHYS_HOST_OFFSET(b)))
++#define REX_LOAD_U16_B(b, d) __builtin_bswap16(*(volatile u16*)(base + (u32)((b) + (d)) + REX_PHYS_HOST_OFFSET(b)))
++#define REX_LOAD_U32_B(b, d) __builtin_bswap32(*(volatile u32*)(base + (u32)((b) + (d)) + REX_PHYS_HOST_OFFSET(b)))
++#define REX_LOAD_U64_B(b, d) __builtin_bswap64(*(volatile u64*)(base + (u32)((b) + (d)) + REX_PHYS_HOST_OFFSET(b)))
++#define REX_STORE_U8_B(b, d, y) (*(volatile u8*)(base + (u32)((b) + (d)) + REX_PHYS_HOST_OFFSET(b)) = (y))
++#define REX_STORE_U16_B(b, d, y) \\
++  (*(volatile u16*)(base + (u32)((b) + (d)) + REX_PHYS_HOST_OFFSET(b)) = __builtin_bswap16(y))
++#define REX_STORE_U32_B(b, d, y) \\
++  (*(volatile u32*)(base + (u32)((b) + (d)) + REX_PHYS_HOST_OFFSET(b)) = __builtin_bswap32(y))
++#define REX_STORE_U64_B(b, d, y) \\
++  (*(volatile u64*)(base + (u32)((b) + (d)) + REX_PHYS_HOST_OFFSET(b)) = __builtin_bswap64(y))
++"""
++
++# 7. An include guard around the whole header.
++if GUARD not in text:
++    text = f"#ifndef {GUARD}\n#define {GUARD}\n" + text.rstrip() + f"\n\n#endif  // {GUARD}\n"
++
++# Only when it changes: every recompiled unit depends on this header through the PCH.
++try:
++    previous = open(dst, encoding="utf-8").read()
++except OSError:
++    previous = None
++if previous == text:
++    print("unchanged", dst)
++else:
++    open(dst, "w", encoding="utf-8", newline="\n").write(text)
++    print("wrote", dst)
+diff --git a/project/tools/patch_branch_traps.py b/project/tools/patch_branch_traps.py
+new file mode 100755
+index 0000000..0b5cbcc
+--- /dev/null
++++ b/project/tools/patch_branch_traps.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python3
++"""Turn the codegen's unresolved-branch traps into the branches they are.
++
++ReXGlue v0.10.0 writes a trap (REX_FATAL("Unresolved branch/call from 0xA to 0xB")) for a branch whose target it could
++not tie to a call target, even when the target is known:
++
++  * a conditional branch back to the entry of the function it is in (a loop whose head is the function's first
++    instruction): the label loc_B is right there, but the branch is classified as a call to a function;
++  * a branch (b, bc) to the entry of another function that names.toml declares: a tail call the discover phase did not
++    record;
++  * a jump table case (REX_FATAL("Jump target 0xB unresolved at bctr 0xA")) whose label is in the same function.
++
++Within the function that holds loc_B the trap becomes `goto loc_B;` (exact). Otherwise, when a function starts at B,
++it becomes a tail call: `B(ctx, base); return;` (as the codegen writes the tail calls it resolved). `bl` (a call that
++comes back) becomes the call alone. A trap whose target is neither is left as it is and listed: the script exits 1.
++
++The codegen also writes `goto loc_B;` for a branch to B inside the address range of the function it is in when B is
++the entry of another function overlapping it (the label is then in that function, not here: GCC stops on "label used
++but not defined"). Those become the same tail call, or are listed if no function starts at B (name it in names.toml).
++
++Usage: patch_branch_traps.py generated/default/*.cpp     (idempotent)
++"""
++import re
++import sys
++
++TRAP = re.compile(r'^(\t+)(?:if \((.+?)\) )?REX_FATAL\("Unresolved (branch|call) from 0x([0-9A-F]{8}) to 0x([0-9A-F]{8})"\);$',
++                  re.M)
++INSN = re.compile(r'^\t// ([a-z.+-]+) ', re.M)
++
++
++def declare(text, names):
++    """The file's own declarations header only declares what the codegen called: add the functions the pass calls."""
++    names = sorted(n for n in names if f'DECLARE_REX_FUNC({n});' not in text)
++    if not names:
++        return text
++    m = list(re.finditer(r'^#include [^\n]*\n', text[:4096], re.M))
++    at = m[-1].end() if m else 0
++    return text[:at] + ''.join(f'DECLARE_REX_FUNC({n});\n' for n in names) + text[at:]
++
++
++def main(paths):
++    texts = {p: open(p, encoding='utf-8').read() for p in paths}
++    # Every function the generated code defines, by address: its registration table ({ 0xADDRESS, name }, in
++    # mp3_init.cpp), which also has the functions names.toml names.
++    starts = {}
++    for t in texts.values():
++        for m in re.finditer(r'\b0x([0-9A-F]{8}), (\w+)\b', t):
++            starts.setdefault(m.group(1), m.group(2))
++
++    fixed = {'goto': 0, 'tail call': 0, 'call': 0}
++    left = []
++    for path, t in texts.items():
++        if 'REX_FATAL("Unresolved' not in t:
++            continue
++        # Function bodies: from one definition to the next.
++        heads = [m.start() for m in re.finditer(r'^\S[^\n]*\) \{$', t, re.M)] + [len(t)]
++        out, last, called = [], 0, set()
++        for m in TRAP.finditer(t):
++            indent, cond, kind, src, dst = m.groups()
++            k = max(i for i, h in enumerate(heads) if h <= m.start()) if heads[0] <= m.start() else -1
++            lo, hi = (heads[k], heads[k + 1]) if k >= 0 else (0, len(t))
++            body = t[lo:hi]
++            insns = INSN.findall(t[max(lo, m.start() - 400):m.start()])
++            mnemonic = insns[-1] if insns else ''
++            if f'\nloc_{dst}:' in body:
++                new, what = f'goto loc_{dst};', 'goto'
++            elif dst in starts:
++                if mnemonic.startswith('bl') and not mnemonic.startswith(('blt', 'ble')) and kind == 'call':
++                    new, what = f'{starts[dst]}(ctx, base);', 'call'
++                else:
++                    new, what = f'{{ {starts[dst]}(ctx, base); return; }}', 'tail call'
++            else:
++                left.append(f'{path}: 0x{src} -> 0x{dst}')
++                continue
++            fixed[what] += 1
++            if what != 'goto':
++                called.add(starts[dst])
++            out.append(t[last:m.start()])
++            out.append(f'{indent}if ({cond}) {new}' if cond else f'{indent}{new}')
++            last = m.end()
++        out.append(t[last:])
++        new_text = declare(''.join(out), called)
++        if new_text != t:
++            open(path, 'w', encoding='utf-8').write(new_text)
++    # Jump table cases the codegen left as traps (REX_FATAL("Jump target 0xB unresolved at bctr 0xA")) although the
++    # case's label is in the same function (Max Payne 3's CRT _output, 56 cases at 0x83010E20): goto, or a tail call
++    # to a function that starts there.
++    fixed['case'] = 0
++    case = re.compile(r'REX_FATAL\("Jump target 0x([0-9A-F]{8}) unresolved at bctr 0x[0-9A-F]{8}"\);')
++    for path in paths:
++        t = open(path, encoding='utf-8').read()
++        if 'REX_FATAL("Jump target' not in t:
++            continue
++        heads = [m.start() for m in re.finditer(r'^\S[^\n]*\) \{$', t, re.M)] + [len(t)]
++        out, called = [t[:heads[0]]], set()
++        for lo, hi in zip(heads, heads[1:]):
++            body = t[lo:hi]
++            labels = set(re.findall(r'^loc_([0-9A-F]{8}):', body, re.M))
++
++            def fix_case(m):
++                dst = m.group(1)
++                if dst in labels:
++                    fixed['case'] += 1
++                    return f'goto loc_{dst};'
++                if dst in starts:
++                    fixed['case'] += 1
++                    called.add(starts[dst])
++                    return f'{{ {starts[dst]}(ctx, base); return; }}'
++                left.append(f'{path}: jump table case 0x{dst} (no label here, no function there)')
++                return m.group(0)
++            out.append(case.sub(fix_case, body))
++        open(path, 'w', encoding='utf-8').write(declare(''.join(out), called))
++    # Gotos to a label the function does not have.
++    fixed['foreign goto'] = 0
++    for path in paths:
++        t = open(path, encoding='utf-8').read()
++        heads = [m.start() for m in re.finditer(r'^\S[^\n]*\) \{$', t, re.M)] + [len(t)]
++        out, changed, called = [t[:heads[0]]], False, set()
++        for lo, hi in zip(heads, heads[1:]):
++            body = t[lo:hi]
++            labels = set(re.findall(r'^loc_([0-9A-F]{8}):', body, re.M))
++
++            def fix(m):
++                nonlocal changed
++                dst = m.group(1)
++                if dst in labels:
++                    return m.group(0)
++                if dst not in starts:
++                    left.append(f'{path}: goto 0x{dst} (no label here, no function there)')
++                    return m.group(0)
++                changed = True
++                called.add(starts[dst])
++                fixed['foreign goto'] += 1
++                return f'{{ {starts[dst]}(ctx, base); return; }}'
++            out.append(re.sub(r'goto loc_([0-9A-F]{8});', fix, body))
++        if changed:
++            open(path, 'w', encoding='utf-8').write(declare(''.join(out), called))
++    print(f"patch_branch_traps: {fixed['goto']} gotos, {fixed['tail call']} tail calls, {fixed['call']} calls; "
++          f"{fixed['foreign goto']} gotos into another function made tail calls; {fixed['case']} jump table cases; "
++          f"{len(left)} left")
++    for line in left:
++        print('  left:', line)
++    return 1 if left else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv[1:]))
+diff --git a/project/tools/patch_game_fixes.py b/project/tools/patch_game_fixes.py
+new file mode 100644
+index 0000000..206830b
+--- /dev/null
++++ b/project/tools/patch_game_fixes.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""vig8-ps4: fixes to the game's own code, applied to the generated C++ (build-vig8.sh codegen, after the speed passes).
++
++Each fix names its guest function and replaces exact pieces of generated code. A fix whose anchors are not found
++exactly as often as expected in the files given stops the build: the codegen or a pass changed that code, look at the
++fix again.
++
++usage: patch_game_fixes.py vig8_recomp.*.cpp
++"""
++import re
++import sys
++
++# The generated code keeps a register either in a local (L_r27) or in the context (ctx.r27), depending on the passes.
++REG = r"(?:L_|ctx\.)"
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Road patch subdivision work stack (v00.08)
++#
++# sub_8211F3B8 tests a ray against a curved road patch by subdividing it: an explicit work stack of 256-byte entries
++# (16 quadwords of control points) at r1+1392 in its 9,840-byte frame, 32 entries (r1+1392 .. r1+9584, the saved
++# registers after it). At 0x8211FB04 (mr r27,r30) a sub-patch whose projected extent is still at or above the
++# threshold is pushed; nothing limits the depth. With an infinite or enormous extent (a ray built from a zero or
++# exploded vector) every sub-patch is pushed again: in v00.07 (2026-11-24, 20 minutes into a race) the stack grew to
++# ~110 entries, through the callers' frames, and the copy into the next entry crossed the main thread's guest stack
++# top (write of 0x70250000) - "Unhandled guest access violation", the app ended. Here a push is made only while the
++# entry after it still fits; a full stack leaves the sub-patch out (logged by vig8_subdivision_stack_full).
++SUBDIVISION_RE = re.compile(
++    r"^loc_8211FB04:\n\t// mr r27,r30\n\t(" + REG + r"r27)\.u64 = (" + REG + r"r30)\.u64;\n", re.M)
++
++
++def subdivision_fix(m):
++    r27, r30 = m.group(1), m.group(2)
++    r1 = r27[:-3] + "r1"
++    return (
++        "loc_8211FB04:\n"
++        "\t// mr r27,r30\n"
++        "\t// vig8-ps4 (patch_game_fixes.py): only while the next 256-byte entry fits the 32-entry work stack.\n"
++        f"\tif ({r30}.u32 + 256u <= {r1}.u32 + 9584u) {{\n"
++        f"\t\t{r27}.u64 = {r30}.u64;\n"
++        "\t} else {\n"
++        f"\t\tvig8_subdivision_stack_full({r1}.u32);\n"
++        "\t}\n")
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# The 3D scene's anti-aliasing (v00.10)
++#
++# The scene renderer sub_820BE790 (per view, every frame) calls sub_82130D00(renderer, 4) - the MSAA mode the render
++# targets are created with (0x82482D90 = 2: 4x) - and sub_82130D28(rects, 16, 8 bytes a sample, 4 samples, width,
++# height, 0, 0), which splits the screen until a piece fits the 360's 2048 EDRAM tiles: at 1280x720 with 4x MSAA four
++# quadrants (640x384, 640x336). With more than one piece it sets them on the renderer (sub_82130EA0), and the D3D
++# runtime's predicated tiling (BeginTiling sub_82140FD0 / EndTiling sub_82141350, run by its worker threads'
++# tiling program, sub_82151048) replays the whole scene once per piece. The GPU is meant to skip the draws outside a
++# piece from the screen extents it writes for each draw (EVENT_WRITE_EXT); the SDK writes the whole screen there (as
++# Xenia does), so the GPU emulation - the port's bottleneck - translated every scene draw 4 times.
++#
++# The sample count becomes vig8_antialiasing's (vig8_ps4_game.cpp): with 1 sample the scene fits the EDRAM, the
++# renderer gets one piece and takes its no-tiling branch (the one it uses at SD resolutions), and every draw is
++# translated once. In that branch the pieces of an earlier 4x frame are cleared as the game's other renderers do
++# (sub_82130EA0(renderer, 0, 0)), so the setting can change while the game runs.
++MSAA_MODE_RE = re.compile(r"^\t// li r4,4\n\t(" + REG + r")r4\.s64 = 4;\n(?=\t// bl 0x82130d00\n)", re.M)
++TILES_SAMPLES_RE = re.compile(
++    r"^\t// li r6,4\n\t(" + REG + r")r6\.s64 = 4;\n(?=\t// li r5,8\n\t(?:L_|ctx\.)r5\.s64 = 8;\n\t// li r4,16\n"
++    r"\t(?:L_|ctx\.)r4\.s64 = 16;\n\t// addi r3,r1,1776\n\t(?:L_|ctx\.)r3\.s64 = (?:L_|ctx\.)r1\.s64 \+ 1776;\n"
++    r"\t// bl 0x82130d28\n)", re.M)
++NO_TILING_RE = re.compile(r"^loc_820BEC98:\n(?=\t// li r5,0\n)", re.M)
++
++
++def msaa_mode_fix(m):
++    return (
++        "\t// li r4,4\n"
++        "\t// vig8-ps4 (patch_game_fixes.py): the scene's MSAA samples, vig8_antialiasing (4 = the original).\n"
++        f"\t{m.group(1)}r4.s64 = vig8_scene_msaa_begin();\n")
++
++
++def tiles_samples_fix(m):
++    return (
++        "\t// li r6,4\n"
++        "\t// vig8-ps4 (patch_game_fixes.py): the same samples for the EDRAM pieces (1: one piece, no tiling).\n"
++        f"\t{m.group(1)}r6.s64 = vig8_scene_msaa_samples();\n")
++
++
++def no_tiling_fix(prefix):
++    def fix(m):
++        return (
++            "loc_820BEC98:\n"
++            "\t// vig8-ps4 (patch_game_fixes.py): one piece - no tiling: clear an earlier 4x frame's pieces, as the\n"
++            "\t// game's other renderers do (sub_82130EA0(renderer, 0, 0)).\n"
++            "\tif (vig8_scene_single_pass()) {\n"
++            f"\t\t__fast__sub_82130EA0(ctx, base, {prefix}r31.u64, 0, 0);\n"
++            "\t}\n")
++    return fix
++
++
++DECLARATIONS = {
++    "subdivision": 'extern "C" void vig8_subdivision_stack_full(uint32_t guest_r1);  // vig8_ps4_game.cpp\n',
++    "antialiasing": ('extern "C" int32_t vig8_scene_msaa_begin(void);    // vig8_ps4_game.cpp\n'
++                     'extern "C" int32_t vig8_scene_msaa_samples(void);  // vig8_ps4_game.cpp\n'
++                     'extern "C" int32_t vig8_scene_single_pass(void);   // vig8_ps4_game.cpp\n'),
++}
++
++
++def count_in(texts, regex):
++    return [(path, len(regex.findall(text))) for path, text in texts.items() if regex.search(text)]
++
++
++def main():
++    texts = {}
++    for path in sys.argv[1:]:
++        with open(path, encoding="utf-8") as f:
++            texts[path] = f.read()
++    changed = {}  # path -> set of declaration keys
++    errors = []
++    applied = []
++
++    # Road patch subdivision.
++    hits = count_in(texts, SUBDIVISION_RE)
++    if sum(n for _, n in hits) != 1:
++        errors.append("sub_8211F3B8's push (loc_8211FB04) found %d times, expected once" % sum(n for _, n in hits))
++    else:
++        path = hits[0][0]
++        texts[path] = SUBDIVISION_RE.sub(subdivision_fix, texts[path])
++        changed.setdefault(path, set()).add("subdivision")
++        applied.append("sub_8211F3B8 subdivision work stack (%s)" % path)
++
++    # Anti-aliasing: three anchors, all in sub_820BE790's file.
++    found = {name: count_in(texts, regex) for name, regex in
++             (("msaa mode", MSAA_MODE_RE), ("tile samples", TILES_SAMPLES_RE), ("no-tiling branch", NO_TILING_RE))}
++    bad = [name for name, hits in found.items() if sum(n for _, n in hits) != 1]
++    paths = {hits[0][0] for hits in found.values() if hits}
++    if bad or len(paths) != 1:
++        errors.append("sub_820BE790's anti-aliasing anchors: %s" % ", ".join(
++            "%s found %d times" % (name, sum(n for _, n in hits)) for name, hits in found.items()))
++    else:
++        path = paths.pop()
++        text = texts[path]
++        prefix = MSAA_MODE_RE.search(text).group(1)
++        text = MSAA_MODE_RE.sub(msaa_mode_fix, text)
++        text = TILES_SAMPLES_RE.sub(tiles_samples_fix, text)
++        text = NO_TILING_RE.sub(no_tiling_fix(prefix), text)
++        texts[path] = text
++        changed.setdefault(path, set()).add("antialiasing")
++        applied.append("sub_820BE790 scene anti-aliasing (%s)" % path)
++
++    if errors:
++        sys.exit("patch_game_fixes: " + "; ".join(errors))
++    for path, keys in changed.items():
++        text = texts[path]
++        # The declarations after the file's includes (a linkage specification cannot go inside the function).
++        includes = list(re.finditer(r"^#include .*\n", text, re.M))
++        at = includes[-1].end() if includes else 0
++        text = text[:at] + "".join(DECLARATIONS[k] for k in sorted(keys)) + text[at:]
++        with open(path, "w", encoding="utf-8", newline="\n") as f:
++            f.write(text)
++    print("patch_game_fixes: %d fixes applied: %s" % (len(applied), "; ".join(applied)))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/project/tools/patch_inline_calls.py b/project/tools/patch_inline_calls.py
+new file mode 100755
+index 0000000..2a36ff9
+--- /dev/null
++++ b/project/tools/patch_inline_calls.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python3
++"""Calls the compiler may inline (make_nx_pch.py's DEFINE_REX_FUNC).
++
++Every recompiled function is a weak, noinline alias (name) of its body (__imp__name), so that a hook can replace it:
++each call, even to a three-instruction getter, is a real call with the guest registers going through memory. A call to
++a function defined in the same file that no hook replaces is rewritten to call the body directly, which GCC may inline
++(it decides by size; the big ones stay calls). GTA IV's city is CPU-bound on the Switch (the game's update and
++render-list threads), with many small functions, so this is where the call overhead adds up. (From gears2-nx, Gears of
++War 2's port, in dantes-inferno-nx's version.)
++
++The hooked functions: a hook replaces a guest function by defining a strong symbol of its name (REX_HOOK_RAW(sub_X),
++REX_EXTERN(name) { ... }), and calls the original as __imp__<name>. So any generated function whose name appears in
++the sources the build compiles (mp3/src, the SDK) counts as hooked: its calls keep going through the alias.
++
++The register save/restore helpers (__savegprlr_N, __restgprlr_N, __savefpr_N, __restfpr_N, __savevmx_N, __restvmx_N)
++are a fifth of all calls and each is defined in one file only: their bodies are copied into
++mp3_inline_helpers.h as always-inline functions (rex_inl___savegprlr_26 ...), every file includes it, and
++every call to a helper becomes a call to its copy, so the stores and loads land in the caller.
++
++Usage: patch_inline_calls.py <source dir>... -- generated/default/vig8_recomp.*.cpp   (idempotent)
++"""
++
++import re
++import sys
++from pathlib import Path
++
++HELPER = r"__(?:save|rest)(?:gpr|gprlr|fpr|vmx)_\d+"
++DEFINE = re.compile(r"^DEFINE_REX_FUNC\(([A-Za-z_]\w*)\)", re.M)
++CALL = re.compile(r"(?<![\w])([A-Za-z_]\w*)\(ctx, base\);")
++IDENT = re.compile(r"\b[A-Za-z_]\w*\b")
++COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
++
++
++def hooked_names(dirs, defined):
++    """The generated functions (of `defined`) the sources name outside comments: hooked, or called from native code.
++    The SDK's code generator (codegen/ folders, not in the NRO) names the helpers it looks for: skipped."""
++    names = set()
++    for d in dirs:
++        for p in Path(d).rglob("*"):
++            if p.suffix in (".cpp", ".h", ".hpp", ".cc", ".inc") and p.is_file() and "codegen" not in p.parts:
++                text = COMMENT.sub(" ", p.read_text(encoding="utf-8", errors="replace"))
++                for w in IDENT.findall(text):
++                    if w.startswith("__imp__"):
++                        w = w[len("__imp__"):]
++                    if w in defined:
++                        names.add(w)
++    return names
++
++
++def defined_names(paths):
++    names = set()
++    for p in paths:
++        names.update(DEFINE.findall(Path(p).read_text(encoding="utf-8", errors="surrogateescape")))
++    return names
++
++
++def patch(path, hooked):
++    text = Path(path).read_text(encoding="utf-8", errors="surrogateescape")
++    local = {n for n in DEFINE.findall(text) if not re.fullmatch(HELPER, n)} - hooked
++    count = 0
++
++    def repl(m):
++        nonlocal count
++        if m.group(1) in local:
++            count += 1
++            return "__imp__" + m.group(0)
++        return m.group(0)
++
++    new = CALL.sub(repl, text)
++    if count:
++        Path(path).write_text(new, encoding="utf-8", errors="surrogateescape")
++    return count
++
++
++HELPER_DEF = re.compile(r"^DEFINE_REX_FUNC\((" + HELPER + r")\) \{\n(.*?)^\}\n", re.M | re.S)
++HELPER_CALL = re.compile(r"(?<![\w])(" + HELPER + r")\(ctx, base\);")
++HEADER = "vig8_inline_helpers.h"
++INCLUDE = '#include "' + HEADER + '"\n'
++
++
++def write_helpers(paths, hooked):
++    bodies = {}
++    for p in paths:
++        text = Path(p).read_text(encoding="utf-8", errors="surrogateescape")
++        for name, body in HELPER_DEF.findall(text):
++            if name not in hooked and "goto " not in body and "loc_" not in body:
++                bodies[name] = body
++    out = ["// Generated by tools/patch_inline_calls.py: the register save/restore helpers, inlined at every call.",
++           "#pragma once", ""]
++    for name in sorted(bodies):
++        out.append(f"static inline __attribute__((always_inline)) void rex_inl_{name}(PPCContext& __restrict ctx, "
++                   f"uint8_t* base) {{")
++        out.append(bodies[name].rstrip("\n"))
++        out.append("}")
++        out.append("")
++    Path(paths[0]).with_name(HEADER).write_text("\n".join(out), encoding="utf-8")
++    return set(bodies)
++
++
++def inline_helpers(path, helpers):
++    text = Path(path).read_text(encoding="utf-8", errors="surrogateescape")
++    count = 0
++
++    def repl(m):
++        nonlocal count
++        if m.group(1) in helpers:
++            count += 1
++            return "rex_inl_" + m.group(0)
++        return m.group(0)
++
++    new = HELPER_CALL.sub(repl, text)
++    if INCLUDE not in new:
++        first = new.find("\n") + 1  # after #include "mp3_funcs.N.h"
++        new = new[:first] + INCLUDE + new[first:]
++    if new != text:
++        Path(path).write_text(new, encoding="utf-8", errors="surrogateescape")
++    return count
++
++
++def main(argv):
++    if "--" not in argv:
++        sys.exit(__doc__)
++    i = argv.index("--")
++    files = argv[i + 1:]
++    hooked = hooked_names(argv[:i], defined_names(files))
++    total = sum(patch(p, hooked) for p in files)
++    helpers = write_helpers(files, hooked)
++    inlined = sum(inline_helpers(p, helpers) for p in files)
++    print(f"patch_inline_calls: {total} same-file calls may be inlined, {inlined} helper calls inlined "
++          f"({len(helpers)} helpers); {len(hooked)} hooked functions kept as calls: {' '.join(sorted(hooked))}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/project/tools/patch_local_regs.py b/project/tools/patch_local_regs.py
+new file mode 100755
+index 0000000..4504511
+--- /dev/null
++++ b/project/tools/patch_local_regs.py
+@@ -0,0 +1,1242 @@
++#!/usr/bin/env python3
++"""Guest registers in host locals inside each recompiled function.
++
++(vig8-ps4: MP3-PS4's mp3/tools/patch_local_regs.py; the file names are vig8's.)
++
++Every guest register of the generated code is a field of the context (ctx.r3.u64, ctx.f1.f64, ctx.cr6.eq ...), and
++every guest memory access is a volatile or memcpy access through `base`. GCC cannot tell the two apart (a byte store
++may alias anything, and the build has -fno-strict-aliasing), so after each guest store it reloads every register it
++needs from ctx and writes each register back as soon as it changes. This pass gives every function its own copies of
++the registers it uses (L_r3, L_f1, L_cr6 ...), which nothing can alias, and keeps ctx exact only where other code
++can look at it: at calls and returns.
++
++Which registers have to go through ctx at a call is worked out for the whole program, from the code itself (not from
++the PowerPC calling convention, which the game's compiler does not always follow between its own functions):
++
++  REF(F)   the registers F (or anything it calls) may read before writing them: they hold F's inputs.
++  MOD(F)   the registers whose value in ctx may differ when F returns.
++  PRES(F)  the registers F saves on its stack at entry and loads back right before every return (the non-volatiles
++           of its prologue and epilogue, inline or through the __savegprlr_N/__savefpr_N helpers): F's own writes to
++           them are not seen by its caller, and their save does not count as a read.
++
++Both are fixpoints over the call graph. At a call to G the caller writes back the registers that changed since ctx
++was last exact ("dirty", a dataflow over labels and gotos) and that G may read or change (REF(G) | MOD(G)), and reads
++back MOD(G) after it. At a return F writes back the dirty registers its caller may read back (MOD(F)) and the saved
++ones whose ctx copy it changed on the way. Calls the code cannot see into are taken at the calling convention's word:
++indirect calls (bctrl), the kernel's imports and the hooked functions (native code) read and change every volatile
++register, and preserve the non-volatiles, r1 and r13 (the guest compiler cannot use its own conventions for a function
++whose address is taken). A jump through a table to a target outside it (the switch fallback) and a call followed by a
++return (a tail call, possibly into the rest of the same function) write everything back.
++
++The register save/restore helpers (rex_inl___savegprlr_N ...) are copied into each function first, so they work on
++the copies too. A function with anything the pass does not understand (another use of ctx) is left as it is; its REF
++and MOD still come from its text.
++
++A guest setjmp/longjmp, if a title needs one (dantes-inferno-nx does): where a host setjmp comes back from a longjmp,
++FiberRestoreContext(ctx, base) loads the guest registers the guest setjmp saved into ctx. That line counts as a call
++that reads nothing and may change every register; the function reloads all its copies after it.
++
++From gears2-nx (Gears of War 2's port, gow2/tools/patch_local_regs.py and gow2/CPU_OPTIMIZATION.md, which explains the
++analyses and the pitfalls met), in dantes-inferno-nx's version (conditional blocks may be skipped; the check build
++also poisons what a return does not hand back); here without the stack guard (this port's REX_FUNC_PROLOGUE has none).
++mp3/CPU_OPTIMIZATION.md says what is different for GTA IV.
++
++Usage: patch_local_regs.py <mp3_inline_helpers.h> <source dir>... -- generated/default/mp3_recomp.*.cpp
++(the source dirs: where the hooks are, as for patch_inline_calls.py)
++"""
++
++import os
++import re
++import sys
++from concurrent.futures import ProcessPoolExecutor
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Registers: one bit each.
++NAMES = ([f"r{i}" for i in range(32)] + [f"f{i}" for i in range(32)] + [f"v{i}" for i in range(128)] +
++         [f"cr{i}" for i in range(8)] + ["xer", "ctr", "lr", "reserved"])
++BIT = {n: i for i, n in enumerate(NAMES)}
++ALL = (1 << len(NAMES)) - 1
++
++
++def mask(names):
++    m = 0
++    for n in names:
++        m |= 1 << BIT[n]
++    return m
++
++
++def nonvolatile(reg):
++    if reg.startswith("cr"):
++        return reg in ("cr2", "cr3", "cr4")
++    kind, num = reg[0], reg[1:]
++    if kind in "rf" and num.isdigit():
++        return int(num) >= 14
++    if kind == "v" and num.isdigit():
++        n = int(num)
++        return 14 <= n <= 31 or n >= 64
++    return False
++
++
++NONVOL = mask(n for n in NAMES if nonvolatile(n))
++# The calling convention: a callee reads and changes any volatile register and preserves the rest (r1 and r13 too).
++# What such a callee may read: its arguments (r3-r10, f1-f13, v1-v13), the stack and thread pointers, the return
++# address, and XER (every compare copies its summary-overflow bit). What it may change: every volatile register.
++ARGS = mask([f"r{i}" for i in range(3, 11)] + [f"f{i}" for i in range(1, 14)] + [f"v{i}" for i in range(1, 14)])
++ABI_REF = ARGS | mask(["r1", "r2", "r13", "lr", "xer"])
++ABI_MOD = ALL & ~NONVOL & ~mask(["r1", "r13"])
++TRAP_REF = mask(["r3", "r4"])
++FASTARGS = __import__("os").environ.get("PLR_FASTARGS", "1") == "1" and __import__("os").environ.get("PLR_CHECK") != "1"
++FAST_GPRS = [f"r{i}" for i in range(3, 11)]
++# mp3-ps4 v00.68 (LRSAVE): an indirect call's target is a guest function, which reads lr only to save it.
++LRSAVE = __import__("os").environ.get("PLR_LRSAVE", "1") == "1"
++ABI_REF_INDIRECT = ABI_REF & ~mask(["lr"]) if LRSAVE else ABI_REF
++TERNKILL = __import__("os").environ.get("PLR_TERNKILL", "1") == "1"
++# One statement that assigns a whole register (its right-hand side may select with ?:).
++WHOLE_ASSIGN = re.compile(r"^ctx\.(?:r\d+|f\d+)\.(?:u64|s64|f64) = [^;{}]*;$")
++LR_SAVE_COPY = re.compile(r"^ctx\.r\d+\.u64 = ctx\.lr;$")
++CHECK = os.environ.get("PLR_CHECK") == "1"
++# Imports that look at the whole register state (a context for a crash report or an exception): this function's
++# registers are all written back before them (the callers' non-volatiles may be stale there).
++CTX_IMPORTS = {"RtlCaptureContext", "RtlRaiseException", "RtlUnwind", "KeBugCheck", "KeBugCheckEx"}
++
++REG = r"(?:r\d+|f\d+|v\d+|cr\d|xer|ctr|lr|reserved)"
++OCC = re.compile(r"\bctx\.(" + REG + r")\b")
++CALL = re.compile(r"\b([A-Za-z_]\w*)\(ctx, base\);")
++TRAP = re.compile(r"\bppc_trap\(ctx, base, \d+\);")
++INDIRECT = "REX_CALL_INDIRECT_FUNC("
++GOTO = re.compile(r"\bgoto (loc_[0-9A-F]+);")
++LABEL = re.compile(r"^(loc_[0-9A-F]+):\s*$")
++OTHER_CTX = re.compile(r"\bctx\b")
++FIBER = "FiberRestoreContext"  # FiberRestoreContext(ctx, base);: back from a guest longjmp, see the docstring
++KEEP = re.compile(r"\bctx\.(?:fpscr|msr)\b")  # stays in ctx: FPSCR and MSR emulation
++COMPOUND = re.compile(r"^(?:\+|-|\*|/|%|&|\||\^|<<|>>)=")
++HELPER_DEF = re.compile(r"^static inline __attribute__\(\(always_inline\)\) void (rex_inl_\w+)\(PPCContext& __restrict "
++                        r"ctx, uint8_t\* base\) \{\n(.*?)^\}\n", re.M | re.S)
++HELPER_CALL = re.compile(r"^\t(rex_inl___(?:save|rest)(?:gpr|gprlr|fpr|vmx)_\d+)\(ctx, base\);\n", re.M)
++
++# Statements the frame analysis understands (on the code with ctx. names).
++R_ADDI = re.compile(r"^ctx\.(r\d+)\.s64 = ctx\.(r\d+)\.s64 \+ (-?\d+);$")
++R_MR = re.compile(r"^ctx\.(r\d+)\.u64 = ctx\.(r\d+)\.u64;$")
++R_LI = re.compile(r"^ctx\.(r\d+)\.s64 = (-?\d+);$")
++EA_D = re.compile(r"^ea = (-?\d+) \+ ctx\.(r\d+)\.u32;$")
++EA_X = re.compile(r"^ea = ctx\.(r\d+)\.u32 \+ ctx\.(r\d+)\.u32;$")
++STWU = re.compile(r"^REX_STORE_U32\(ea, ctx\.(r\d+)\.u32\);$")
++R1_EA = re.compile(r"^ctx\.r1\.u32 = ea;$")
++BACKCHAIN = re.compile(r"^ctx\.r1\.u64 = REX_S?LOAD_U32\(ctx\.r1\.u32 \+ 0\);$")
++SAVE = re.compile(r"^REX_SSTORE_U64\(ctx\.(r\d+)\.u32 \+ (-?\d+), ctx\.((?:r|f)\d+)\.u64\);$")
++RESTORE = re.compile(r"^ctx\.((?:r|f)\d+)\.u64 = REX_SLOAD_U64\(ctx\.(r\d+)\.u32 \+ (-?\d+)\);$")
++
++
++def code_part(line):
++    i = line.find("//")
++    return line if i < 0 else line[:i]
++
++
++def access(code, m):
++    """(writes, full) for the occurrence m: whether it writes the register and whether it replaces all of it."""
++    reg = m.group(1)
++    rest = code[m.end():]
++    f = re.match(r"(\.(\w+))?(\[[^\]]*\])?\s*", rest)
++    field, index = f.group(2), f.group(3)
++    after = rest[f.end():]
++    if field in ("compare", "setFromMask"):
++        return True, True
++    if field == "set_raw":
++        return True, True
++    if after.startswith("=") and not after.startswith("=="):
++        if reg == "reserved":
++            return True, True  # lwarx: only its stwcx. reads it
++        if index:
++            return True, False
++        if field is None:
++            return True, True
++        if reg[0] in "rf" or reg in ("ctr", "reserved"):
++            return True, field in ("u64", "s64", "f64")
++        return True, False  # a field of a CR, XER, vector
++    if COMPOUND.match(after) or after.startswith("++") or after.startswith("--"):
++        return True, False
++    before = code[:m.start()]
++    if re.search(r"store\w*\(\s*(?:\([^()]*\*\)\s*)?&?$", before):
++        # A 128-bit store into a vector register replaces it; anything else is partial.
++        full = reg[0] == "v" and re.search(r"simde_mm_store_(?:si128|ps)\(\s*(?:\([^()]*\*\)\s*)?$", before) is not None
++        return True, full
++    if re.search(r"load\w*\(\s*(?:\([^()]*\*\)\s*)?&?$", before):
++        return False, False
++    if before.endswith("&") or re.search(r"\*\)\s*$", before):
++        return True, False
++    return False, False
++
++
++def find_indirect(code):
++    spans = []
++    i = code.find(INDIRECT)
++    while i >= 0:
++        j = i + len(INDIRECT)
++        depth = 1
++        while depth and j < len(code):
++            if code[j] == "(":
++                depth += 1
++            elif code[j] == ")":
++                depth -= 1
++            j += 1
++        if code[j:j + 1] == ";":
++            j += 1
++        spans.append((i, j))
++        i = code.find(INDIRECT, j)
++    return spans
++
++
++class Skip(Exception):
++    pass
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Parsing one function.
++
++class Func:
++    """What the analyses need from one function body."""
++
++    def __init__(self, name, body):
++        self.name = name
++        self.body = body
++        self.start = 0
++        while self.start < len(body) and body[self.start].strip().startswith("REX_FUNC_PROLOGUE"):
++            self.start += 1
++        self.ok = True  # can be rewritten (no unknown ctx use)
++        self.reason = ""
++        n = len(body)
++        self.n = n
++        self.use = [0] * n      # read (a partial write reads the rest)
++        self.kill = [0] * n     # replaced
++        self.wr = [0] * n       # written
++        self.calls = [None] * n  # list of (kind, target) on the line; kind: 'd' direct, 'i' indirect, 's' switch
++        #                          fallback, 't' trap, 'x' FiberRestoreContext
++        self.plain = [False] * n
++        self.tail = [False] * n
++        self.returns = [False] * n
++        self.succ = [None] * n
++        self.depth = [1] * n
++        labels = {}
++        depth = 1
++        gotos = []
++        # For each open brace: whether what is inside may not run (opened by an if/else/switch line), and its line.
++        cond_stack = []
++        skips = []  # (line opening a conditional block, line closing it): the path that does not run the block
++        prologue = True  # LRSAVE: before any label, call, goto or condition
++        for i, line in enumerate(body):
++            lm = LABEL.match(line)
++            if lm:
++                labels[lm.group(1)] = i
++            code = code_part(line)
++            self.depth[i] = depth
++            if i >= self.start and code.strip():
++                use = kill = wr = 0
++                for m in OCC.finditer(code):
++                    b = 1 << BIT[m.group(1)]
++                    w, full = access(code, m)
++                    if w:
++                        wr |= b
++                        if full:
++                            kill |= b
++                        else:
++                            use |= b
++                    else:
++                        use |= b
++                # x = x + 1: the read comes first. A write that may not happen (in an if, in a conditional block)
++                # replaces nothing for certain.
++                if any(c for c, _ in cond_stack) or re.search(r"\b(?:if|else|switch|case|default|for|while|do)\b", code):
++                    kill = 0
++                elif "?" in code and not (TERNKILL and WHOLE_ASSIGN.match(code.strip())):
++                    kill = 0
++                if lm or GOTO.search(code) or "(ctx, base)" in code or INDIRECT in code or \
++                        re.search(r"\b(?:if|else|switch|case|for|while|do)\b", code):
++                    prologue = False
++                if LRSAVE and prologue and LR_SAVE_COPY.match(code.strip()):
++                    use &= ~(1 << BIT["lr"])
++                self.use[i], self.kill[i], self.wr[i] = use, kill, wr
++                stripped = OCC.sub("", code)
++                stripped = KEEP.sub("", stripped)
++                stripped = CALL.sub("", stripped)
++                stripped = TRAP.sub("", stripped)
++                stripped = stripped.replace(INDIRECT, "")
++                if OTHER_CTX.search(stripped) or "ppc_setjmp" in code or "SEH_" in code:
++                    self.ok = False
++                    self.reason = "ctx use: " + line.strip()[:60]
++                calls = [("i", None) for _ in find_indirect(code)]
++                for m in CALL.finditer(code):
++                    calls.append(("x", None) if m.group(1) == FIBER else ("d", m.group(1)))
++                if TRAP.search(code):
++                    calls.append(("t", None))
++                if calls:
++                    self.calls[i] = calls
++                    s = code.strip()
++                    self.plain[i] = len(calls) == 1 and calls[0][0] != "t" and (
++                        bool(re.fullmatch(r"[A-Za-z_]\w*\(ctx, base\);", s)) or
++                        (s.startswith(INDIRECT) and find_indirect(s) == [(0, len(s))]))
++                self.returns[i] = "return;" in code
++                gotos.append((i, GOTO.findall(code)))
++            conditional = re.search(r"\b(?:if|else|switch|case|default|for|while|do)\b", code) is not None
++            for ch in code:
++                if ch == "{":
++                    cond_stack.append((conditional, i))
++                elif ch == "}" and cond_stack:
++                    c, opened = cond_stack.pop()
++                    if c and opened != i:
++                        skips.append((opened, i))
++            depth += code.count("{") - code.count("}")
++        if depth != 1:
++            raise Skip("unbalanced braces")
++        # Switch fallback: REX_CALL_INDIRECT_FUNC inside a switch's default.
++        for i in range(n):
++            if self.calls[i] and any(k == "i" for k, _ in self.calls[i]) and self.depth[i] > 1:
++                j = i - 1
++                while j >= 0 and not code_part(body[j]).strip():
++                    j -= 1
++                if j >= 0 and code_part(body[j]).strip() == "default:":
++                    self.calls[i] = [("s", None) if k == "i" else (k, t) for k, t in self.calls[i]]
++        # Tail calls: a call statement followed by return.
++        for i in range(n):
++            if self.calls[i] and self.plain[i]:
++                for j in range(i + 1, n):
++                    s = code_part(body[j]).strip()
++                    if s:
++                        self.tail[i] = s == "return;"
++                        break
++                else:
++                    self.tail[i] = True
++        # Control flow: lines fall through unless they are an unconditional goto/return at the top level. A conditional
++        # block may also be skipped: an edge from its opening line to its closing one. (Falling through the block's
++        # lines alone is not enough: a call in it clears the dirty registers, `if (c) { X(ctx, base); return; }` made
++        # the code after the block look clean on the path where c is false, and r1 went unwritten before the next
++        # call there: the callee's frame overwrote this function's saved registers.)
++        gmap = dict(gotos)
++        skipmap = {}
++        for a, b in skips:
++            skipmap.setdefault(a, []).append(b)
++        for i in range(n):
++            s = code_part(body[i]).strip()
++            term = self.depth[i] == 1 and (s == "return;" or (s.startswith("goto ") and s.endswith(";") and
++                                                               s.count(";") == 1))
++            succ = [] if term else [i + 1]
++            succ.extend(b for b in skipmap.get(i, ()) if b not in succ)
++            for g in gmap.get(i, ()):
++                if g not in labels:
++                    raise Skip("goto to unknown label " + g)
++                succ.append(labels[g])
++            self.succ[i] = succ
++        self.used = 0
++        self.written = 0
++        for i in range(n):
++            self.used |= self.use[i] | self.wr[i]
++            self.written |= self.wr[i]
++        self.reach = self._reach()
++        self.sp_keep = False
++        self.pres, self.save_lines, self.restore_lines = self._preserved()
++
++    def _reach(self):
++        reach = [False] * (self.n + 1)
++        work = [0]
++        reach[0] = True
++        while work:
++            i = work.pop()
++            if i >= self.n:
++                continue
++            for s in self.succ[i]:
++                if not reach[s]:
++                    reach[s] = True
++                    work.append(s)
++        return reach
++
++    def _preserved(self):
++        """PRES: registers saved at entry (straight-line prefix) into a frame slot and loaded back from it right
++        before every return (no write and no call in between, but a tail call). Returns (mask, {line: reg})."""
++        body, n = self.body, self.n
++        # Symbolic values: register -> offset from the entry r1, for the registers that hold one; plus 'ea' and the
++        # back chain (the r1 the last stwu/stwux saved).
++        def step(state, code):
++            s = code.strip()
++            if not s:
++                return state
++            m = R_ADDI.match(s)
++            if m:
++                d, a, k = m.groups()
++                st = dict(state)
++                if a in st:
++                    st[d] = st[a] + int(k)
++                else:
++                    st.pop(d, None)
++                return st
++            m = R_MR.match(s)
++            if m:
++                d, a = m.groups()
++                st = dict(state)
++                if a in st:
++                    st[d] = st[a]
++                else:
++                    st.pop(d, None)
++                return st
++            m = EA_D.match(s)
++            if m:
++                k, a = m.groups()
++                st = dict(state)
++                if a in st:
++                    st["ea"] = st[a] + int(k)
++                else:
++                    st.pop("ea", None)
++                return st
++            m = EA_X.match(s)
++            if m:
++                st = dict(state)
++                st.pop("ea", None)
++                return st
++            m = STWU.match(s)
++            if m:
++                st = dict(state)
++                if m.group(1) in st:
++                    st["bc"] = st[m.group(1)]
++                else:
++                    st.pop("bc", None)
++                return st
++            if R1_EA.match(s):
++                st = dict(state)
++                if "ea" in st:
++                    st["r1"] = st["ea"]
++                else:
++                    st.pop("r1", None)
++                return st
++            if BACKCHAIN.match(s):
++                st = dict(state)
++                if "bc" in st:
++                    st["r1"] = st["bc"]
++                else:
++                    st.pop("r1", None)
++                st.pop("bc", None)
++                return st
++            # Anything else that writes a tracked register forgets it.
++            st = state
++            for m in OCC.finditer(s):
++                r = m.group(1)
++                if r in state and access(s, m)[0]:
++                    if st is state:
++                        st = dict(state)
++                    st.pop(r, None)
++            if "ea =" in s and "ea" in st:
++                if st is state:
++                    st = dict(state)
++                st.pop("ea", None)
++            return st
++
++        # Forward must-analysis of the symbolic values (intersection at joins).
++        TOP = None
++        states = [TOP] * (n + 1)
++        states[self.start] = {"r1": 0}
++        order = list(range(self.start, n))
++        changed = True
++        out = [TOP] * n
++        while changed:
++            changed = False
++            for i in order:
++                if states[i] is TOP:
++                    continue
++                o = step(states[i], code_part(body[i]))
++                if self.calls[i]:
++                    # A call leaves r1 alone (MOD never has r1, see ABI_MOD); everything volatile is forgotten.
++                    o = {k: v for k, v in o.items() if k in ("r1", "bc") or (k.startswith("r") and k != "ea" and
++                                                                              nonvolatile(k))}
++                if o != out[i]:
++                    out[i] = o
++                    for s in self.succ[i]:
++                        cur = states[s]
++                        new = dict(o) if cur is TOP else {k: v for k, v in cur.items() if o.get(k) == v}
++                        if new != cur:
++                            states[s] = new
++                            changed = True
++        # mp3-ps4 v00.67 (SPKEEP): r1 back at its entry value at every reachable return (and the end).
++        self.sp_keep = True
++        reached = False
++        for i in range(self.start, n):
++            if out[i] is TOP:
++                continue
++            ends = self.returns[i] or any(s >= n for s in self.succ[i])
++            if ends:
++                reached = True
++                if out[i].get("r1") != 0:
++                    self.sp_keep = False
++                    break
++        if not reached:
++            self.sp_keep = False
++        # Saves in the straight-line prefix (before any label, branch or call).
++        saves = {}       # slot -> reg
++        save_lines = {}  # line -> reg
++        written = 0
++        for i in range(self.start, n):
++            line = body[i]
++            code = code_part(line).strip()
++            if LABEL.match(line) or self.calls[i] or GOTO.search(code) or "return;" in code or "if (" in code or \
++                    "switch" in code:
++                break
++            m = SAVE.match(code)
++            if m and states[i] is not TOP:
++                base_reg, k, reg = m.groups()
++                if base_reg in states[i] and not (written >> BIT[reg] & 1) and nonvolatile(reg):
++                    slot = states[i][base_reg] + int(k)
++                    if slot in saves:
++                        saves[slot] = None
++                    else:
++                        saves[slot] = reg
++                        save_lines[i] = reg
++            written |= self.wr[i]
++        cand = {r for r in saves.values() if r}
++        if not cand:
++            return 0, {}, {}
++        # Any other store into a save slot through a known frame address spoils it.
++        for i in range(self.start, n):
++            if i in save_lines or states[i] is TOP:
++                continue
++            code = code_part(body[i]).strip()
++            m = re.match(r"^REX_S?STORE_U(\d+)\((?:ctx\.(r\d+)\.u32 \+ (-?\d+)|ea),", code)
++            if m:
++                size = int(m.group(1)) // 8
++                if m.group(2):
++                    if m.group(2) not in states[i]:
++                        continue
++                    addr = states[i][m.group(2)] + int(m.group(3))
++                elif "ea" in states[i]:
++                    addr = states[i]["ea"]
++                else:
++                    continue
++                for slot, reg in list(saves.items()):
++                    if reg and addr < slot + 8 and slot < addr + size:
++                        cand.discard(reg)
++        # Must-analysis: the registers restored from their slot with nothing after (but a tail call).
++        cmask = mask(cand)
++        rest_in = [None] * (n + 1)
++        rest_in[self.start] = 0
++        work = [self.start]
++        ret_ok = cmask
++        reached_ret = False
++        restore_lines = {}
++        while work:
++            i = work.pop()
++            if i >= n:
++                continue
++            cur = rest_in[i]
++            code = code_part(body[i]).strip()
++            m = RESTORE.match(code)
++            o = cur & ~self.wr[i]
++            if m:
++                reg, base_reg, k = m.groups()
++                st = states[i]
++                if reg in cand and st is not TOP and base_reg in st:
++                    slot = st[base_reg] + int(k)
++                    if saves.get(slot) == reg:
++                        o |= 1 << BIT[reg]
++                        restore_lines[i] = reg
++            if self.calls[i] and not self.tail[i]:
++                o = 0
++            if self.returns[i]:
++                reached_ret = True
++                ret_ok &= o
++            for s in self.succ[i]:
++                if s >= n:
++                    # Falling off the end is a return too.
++                    reached_ret = True
++                    ret_ok &= o
++                    continue
++                if rest_in[s] is None:
++                    rest_in[s] = o
++                    work.append(s)
++                elif rest_in[s] & o != rest_in[s]:
++                    rest_in[s] &= o
++                    work.append(s)
++        if not reached_ret:
++            return 0, {}, {}
++        pres = ret_ok & cmask
++        return (pres, {i: r for i, r in save_lines.items() if pres >> BIT[r] & 1},
++                {i: r for i, r in restore_lines.items() if pres >> BIT[r] & 1})
++
++
++def parse_file(path, helpers):
++    text = open(path, encoding="utf-8", errors="surrogateescape").read()
++
++    def inline(m):
++        body = helpers.get(m.group(1))
++        if body is None:
++            return m.group(0)
++        return "\t{\n" + "".join("\t" + l + "\n" for l in body) + "\t}\n"
++
++    text = HELPER_CALL.sub(inline, text)
++    lines = text.split("\n")
++    funcs = []  # (name, start line index of DEFINE, end index of }, Func or None)
++    i = 0
++    while i < len(lines):
++        line = lines[i]
++        if line.startswith("DEFINE_REX_FUNC(") and line.endswith("{"):
++            j = i + 1
++            while lines[j] != "}":
++                j += 1
++            name = line[len("DEFINE_REX_FUNC("):line.index(")")]
++            try:
++                f = Func(name, lines[i + 1:j])
++            except Skip as e:
++                f = None
++                print(f"patch_local_regs: {name} left as it is ({e})", file=sys.stderr)
++            funcs.append((name, i, j, f))
++            i = j
++        i += 1
++    return lines, funcs
++
++
++def load_helpers(path):
++    text = open(path, encoding="utf-8").read()
++    helpers = {}
++    for name, body in HELPER_DEF.findall(text):
++        helpers[name] = [l for l in body.split("\n") if l.strip() and not l.strip().startswith("REX_FUNC_PROLOGUE")
++                         and l.strip() != "return;"]
++    return helpers
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Phase 1 (per file): the facts the whole-program fixpoint needs.
++
++def summarize(f):
++    """Compact form of a function for the REF/MOD fixpoint: basic blocks (use, kill) and call nodes."""
++    n = f.n
++    nodes = []  # (use, kill, call) with call = None or (kind, target)
++    node_of = {}
++    # One node per line (lines without anything are kept as empty nodes so successors stay simple), but only
++    # reachable ones matter.
++    for i in range(n):
++        use, kill = f.use[i], f.kill[i]
++        if i in f.save_lines:
++            use &= ~(1 << BIT[f.save_lines[i]])
++        call = None
++        if f.calls[i]:
++            call = tuple(f.calls[i])
++        nodes.append((use, kill, call, tuple(f.succ[i]), f.tail[i], f.returns[i]))
++    return {
++        "nodes": nodes,
++        "start": f.start,
++        "written": f.written,
++        "pres": f.pres,
++        "sp_keep": f.sp_keep,
++        "used": f.used,
++    }
++
++
++def phase1(args):
++    path, helpers = args
++    _, funcs = parse_file(path, helpers)
++    out = {}
++    for name, _, _, f in funcs:
++        # A function the pass cannot follow (another use of ctx) may read and change anything.
++        out[name] = summarize(f) if f is not None and f.ok else None
++    return out
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Phase 2: REF / MOD fixpoints.
++
++def call_ref_mod(kind, target, ref, mod, hooked, defined):
++    if kind == "t":
++        return TRAP_REF, 0
++    if kind == "x":
++        return 0, ALL
++    if kind == "s":
++        # A jump table's out-of-range path: dispatched like a tail call through a pointer.
++        return ABI_REF, ABI_MOD
++    if kind == "i":
++        return ABI_REF_INDIRECT, ABI_MOD
++    # direct
++    if target.startswith("__imp__"):
++        inner = target[len("__imp__"):]
++        if inner in defined:
++            return ref.get(inner, ALL), mod.get(inner, ALL)
++        return ABI_REF, ABI_MOD  # a kernel import
++    r, m = ref.get(target, ALL), mod.get(target, ALL)
++    if target in hooked or target not in defined:  # (functions codegen/names.toml names are the game's own code)
++        r |= ABI_REF
++        m |= ABI_MOD
++    return r, m
++
++
++def liveness(s, ref, mod, hooked, defined, at_return, calls_read=True):
++    """Backward liveness over the lines: a call reads REF of its callee (and changes nothing for certain), a return
++    (and the end of the function) reads at_return. Returns (live_in, live_out) per line."""
++    nodes = s["nodes"]
++    n = len(nodes)
++    live = [0] * (n + 1)
++    live[n] = at_return
++    outs = [0] * n
++    callref = [0] * n
++    for i in range(n):
++        call = nodes[i][2]
++        if call and calls_read:
++            for kind, target in call:
++                callref[i] |= call_ref_mod(kind, target, ref, mod, hooked, defined)[0]
++    changed = True
++    while changed:
++        changed = False
++        for i in range(n - 1, -1, -1):
++            use, kill, call, succ, tail, ret = nodes[i]
++            out = 0
++            for t in succ:
++                out |= live[t]
++            outs[i] = out
++            inn = (out & ~kill) | use | callref[i]
++            if ret:
++                inn |= at_return
++            if inn != live[i]:
++                live[i] = inn
++                changed = True
++    return live, outs
++
++
++def compute_ref(s, ref, mod, hooked, defined):
++    live, _ = liveness(s, ref, mod, hooked, defined, 0)
++    n = len(s["nodes"])
++    return live[s["start"]] if s["start"] < n else 0
++
++
++def compute_mod(s, ref, mod, hooked, defined):
++    m = s["written"]
++    tailm = 0
++    for use, kill, call, succ, tail, ret in s["nodes"]:
++        if call:
++            for kind, target in call:
++                _, cm = call_ref_mod(kind, target, ref, mod, hooked, defined)
++                if tail:
++                    tailm |= cm
++                else:
++                    m |= cm
++    return (m & ~s["pres"]) | tailm
++
++
++def fixpoint(summ, hooked):
++    defined = set(summ)
++    callers = {}
++    for name, s in summ.items():
++        if s is None:
++            continue
++        for use, kill, call, succ, tail, ret in s["nodes"]:
++            if call:
++                for kind, target in call:
++                    if kind == "d":
++                        t = target[len("__imp__"):] if target.startswith("__imp__") else target
++                        callers.setdefault(t, set()).add(name)
++    ref = {name: 0 for name in summ}
++    mod = {name: 0 for name in summ}
++    for name, s in summ.items():
++        if s is None:
++            ref[name] = ALL
++            mod[name] = ALL
++    # MOD first (it does not depend on REF), then REF.
++    for which in ("mod", "ref"):
++        work = [name for name, s in summ.items() if s is not None]
++        inwork = set(work)
++        rounds = 0
++        while work:
++            name = work.pop()
++            inwork.discard(name)
++            rounds += 1
++            s = summ[name]
++            if which == "mod":
++                new = compute_mod(s, ref, mod, hooked, defined)
++                old = mod[name]
++                if new != old:
++                    mod[name] = new | old
++            else:
++                new = compute_ref(s, ref, mod, hooked, defined)
++                old = ref[name]
++                if new != old:
++                    ref[name] = new | old
++            if new != old:
++                for c in callers.get(name, ()):
++                    if c not in inwork and summ.get(c) is not None:
++                        inwork.add(c)
++                        work.append(c)
++    return ref, mod
++
++
++def compute_must(s, must, hooked, defined):
++    """The registers replaced on every path to every return (see MUSTMOD in the docstring of make_plr_must.py)."""
++    nodes = s["nodes"]
++    n = len(nodes)
++    start = s["start"]
++    if start >= n:
++        return 0
++    TOP = None
++    din = [TOP] * n
++    din[start] = 0
++    work = [start]
++    at_ret = TOP
++    while work:
++        i = work.pop()
++        cur = din[i]
++        use, kill, call, succ, tail, ret = nodes[i]
++        o = cur | kill
++        tail_must = 0
++        if call:
++            for kind, target in call:
++                if kind != "d":
++                    continue
++                t = target[len("__imp__"):] if target.startswith("__imp__") else target
++                if t in defined and t not in hooked and must.get(t) is not None:
++                    if tail:
++                        tail_must |= must[t]
++                    else:
++                        o |= must[t]
++        if ret or tail:
++            r = o | tail_must
++            at_ret = r if at_ret is TOP else at_ret & r
++        for t in succ:
++            if t >= n:
++                at_ret = o if at_ret is TOP else at_ret & o
++                continue
++            if din[t] is TOP:
++                din[t] = o
++                work.append(t)
++            elif din[t] & ~o:
++                din[t] &= o
++                work.append(t)
++    if at_ret is TOP:
++        return 0
++    return at_ret & ~s["pres"]
++
++
++def fixpoint_must(summ, hooked):
++    """MUST for every function: a least fixpoint from 0 (a callee's MUST only adds), so recursion gives nothing."""
++    defined = set(summ)
++    callers = {}
++    for name, s in summ.items():
++        if s is None:
++            continue
++        for use, kill, call, succ, tail, ret in s["nodes"]:
++            if call:
++                for kind, target in call:
++                    if kind == "d":
++                        t = target[len("__imp__"):] if target.startswith("__imp__") else target
++                        callers.setdefault(t, set()).add(name)
++    must = {name: (0 if s is not None else None) for name, s in summ.items()}
++    work = [name for name, s in summ.items() if s is not None]
++    inwork = set(work)
++    while work:
++        name = work.pop()
++        inwork.discard(name)
++        new = compute_must(summ[name], must, hooked, defined)
++        if new & ~must[name]:
++            must[name] |= new
++            for c in callers.get(name, ()):
++                if c not in inwork and summ.get(c) is not None:
++                    inwork.add(c)
++                    work.append(c)
++    return must
++
++
++# What native code may read in ctx after calling a guest function (thread entries, callbacks, the stack cut), and what
++# every function's return keeps exact on top of what its callers read after the call.
++RESULT_FLOOR = mask(["r1", "r3", "r4", "r13", "f1", "f2", "v2", "xer"])
++
++
++def fixpoint_liveout(summ, ref, mod, hooked, defined, native):
++    """LIVEOUT(F): the registers a caller may read after F returns (before writing them): from the liveness after
++    every call site of F, the callers' own LIVEOUT through their returns, and after every indirect call (any
++    function may be the target of one)."""
++    if any(s is None for s in summ.values()):
++        return {name: ALL for name in summ}
++    floor = RESULT_FLOOR
++    liveout = {name: floor for name in summ}
++    for name in native | hooked:
++        if name in liveout:
++            liveout[name] = ALL
++    work = list(summ)
++    inwork = set(work)
++    while work:
++        name = work.pop()
++        inwork.discard(name)
++        s = summ[name]
++        live, outs = liveness(s, ref, mod, hooked, defined, liveout[name])
++        own = None
++        grew_floor = 0
++        for i, (use, kill, call, succ, tail, ret) in enumerate(s["nodes"]):
++            if not call:
++                continue
++            after = outs[i] | (liveout[name] if ret else 0)
++            for kind, target in call:
++                if kind == "d":
++                    t = target[len("__imp__"):] if target.startswith("__imp__") else target
++                    if t in liveout and after & ~liveout[t]:
++                        liveout[t] |= after
++                        if t not in inwork:
++                            inwork.add(t)
++                            work.append(t)
++                elif kind == "i":
++                    # What the code after an indirect call reads of the volatile registers itself (the target
++                    # preserves the others): the registers later callees read (REF) are their arguments, set
++                    # after this call, not something an unknown target hands over. (The switch fallback, kind "s",
++                    # is a jump table's out-of-range path.)
++                    if own is None:
++                        own = liveness(s, ref, mod, hooked, defined, liveout[name] & RESULT_FLOOR, False)[1]
++                    # The non-volatiles are another matter: the target must leave their ctx copy as it found it
++                    # when anything after the call may read it (a later callee's REF included), so those count
++                    # in full.
++                    after = ((own[i] | (liveout[name] & RESULT_FLOOR if ret else 0)) & ABI_MOD) | (
++                        (outs[i] | (liveout[name] if ret else 0)) & ~ABI_MOD)
++                    grew_floor |= after
++        if grew_floor & ~floor:
++            floor |= grew_floor
++            for t in liveout:
++                if floor & ~liveout[t]:
++                    liveout[t] |= floor
++                    if t not in inwork:
++                        inwork.add(t)
++                        work.append(t)
++    return liveout
++
++
++# ---------------------------------------------------------------------------------------------------------------------
++# Phase 3 (per file): the rewrite.
++
++def flush(m, names):
++    return "".join(f"ctx.{r} = L_{r}; " for r in names if m >> BIT[r] & 1)
++
++
++def reload(m, names):
++    return "".join(f" L_{r} = ctx.{r};" for r in names if m >> BIT[r] & 1)
++
++
++def ctype(r):
++    if r == "lr":
++        return "uint64_t"
++    if r == "xer":
++        return "PPCXERRegister"
++    if r.startswith("cr"):
++        return "PPCCRRegister"
++    if r[0] == "v":
++        return "PPCVRegister"
++    return "PPCRegister"
++
++
++def rewrite(f, ref, mod, liveout, hooked, defined, sites=None, must=None, spkeep=None, fast=None):
++    body, n = f.body, f.n
++    if not f.used:
++        return None
++    names = [r for r in NAMES if f.used >> BIT[r] & 1]
++
++    def site(kind, target):
++        return call_ref_mod(kind, target, ref, mod, hooked, defined)
++
++    # The registers whose ctx copy this function may change: written ones it writes back at a call, and what its
++    # callees change. MOD(F) | CH: what a return writes back (when dirty).
++    ch = 0
++    for i in range(n):
++        if f.calls[i]:
++            for kind, target in f.calls[i]:
++                r, m = site(kind, target)
++                ch |= m | (f.written & (r | m))
++    # ... of which the caller may read back: LIVEOUT(F).
++    at_return = (mod[f.name] | ch) & liveout[f.name]
++    _, live_out = liveness(summarize(f), ref, mod, hooked, defined, liveout[f.name])
++
++    # Saved registers nobody gets back: not written back at a return, not read by a tail call, not read between
++    # their restore and the return. Their save and restore go (the frame slot is left as it was).
++    strip = f.pres & ~at_return
++    for i in range(n):
++        if f.calls[i] and f.tail[i]:
++            for kind, target in f.calls[i]:
++                strip &= ~site(kind, target)[0]
++                if kind == "s" or (target or "").replace("__imp__", "", 1) in CTX_IMPORTS:
++                    strip = 0
++    for i, reg in f.restore_lines.items():
++        b = 1 << BIT[reg]
++        if not strip & b:
++            continue
++        j = i + 1
++        while j < n:
++            if f.use[j] & b or f.wr[j] & b or GOTO.search(code_part(body[j])) or LABEL.match(body[j]):
++                strip &= ~b
++                break
++            if f.returns[j] or (f.calls[j] and f.tail[j]):
++                break
++            if f.calls[j]:
++                strip &= ~b
++                break
++            j += 1
++        else:
++            strip &= ~b
++    dropped = {i for i, r in f.save_lines.items() if strip >> BIT[r] & 1}
++    dropped |= {i for i, r in f.restore_lines.items() if strip >> BIT[r] & 1}
++
++    fast = fast or {}
++    own_args = fast.get(f.name, [])
++
++    def fast_of(kind, target):
++        """FASTARGS: the fast entry's argument registers for a direct call to it, else None."""
++        if kind != "d" or not target:
++            return None
++        t = target[len("__imp__"):] if target.startswith("__imp__") else target
++        return fast.get(t)
++
++    # Forward may-dirty dataflow. (FASTARGS: the fast entry's arguments are not in ctx: dirty from the start.)
++    din = [0] * (n + 1)
++    din[f.start] = mask(own_args)
++    seen = [False] * (n + 1)
++    seen[f.start] = True
++    work = [f.start]
++    while work:
++        i = work.pop()
++        if i >= n:
++            continue
++        cur = din[i] | f.wr[i]
++        if f.calls[i] and f.plain[i]:
++            kind, target = f.calls[i][0]
++            r, m = site(kind, target)
++            if f.tail[i]:
++                cur = 0
++            else:
++                fa = fast_of(kind, target)
++                cur &= ~((r & ~mask(fa)) | m) if fa else ~(r | m)
++        for s in f.succ[i]:
++            nd = din[s] | cur
++            if nd != din[s] or not seen[s]:
++                din[s] = nd
++                seen[s] = True
++                work.append(s)
++
++    def ret_poison(here, calls):
++        """PLR_CHECK=1: at a return, the GPRs/FPRs this function changed (dirty) that its callers may not read back
++        (MOD | CH, not in LIVEOUT) get a poison naming the return; a caller reading one faults at 0x5Exxxxxx (a
++        LIVEOUT mistake: the caller would have read a stale value from ctx)."""
++        if not CHECK or calls:
++            return ""
++        pm = here & (mod[f.name] | ch) & ~liveout[f.name]
++        regs = [x for x in names if x[0] in "rf" and x[1:].isdigit() and pm >> BIT[x] & 1]
++        if not regs:
++            return ""
++        sid = sites["base"] + len(sites["list"])
++        sites["list"].append(f"{sid:06X} {f.name} line {i if i < n else n} returns")
++        pv = 0x5EAD5EAD00000000 | 0x5E000000 | sid
++        return "".join(f"ctx.{x}.u64 = 0x{pv:X}ull; " for x in regs)
++
++    out = body[:f.start]
++    out.extend((f"\tPPCRegister L_{r}; L_{r}.u64 = a_{r};" if r in own_args else f"\t{ctype(r)} L_{r} = ctx.{r};")
++               for r in names)
++    sub = lambda m: "L_" + m.group(1)
++    for i in range(f.start, n):
++        line = body[i]
++        if i in dropped:
++            out.append("\t// (save/restore of a register nobody gets back: dropped)")
++            continue
++        if not (f.use[i] or f.wr[i] or f.calls[i] or f.returns[i]):
++            out.append(line)
++            continue
++        code = code_part(line)
++        comment = line[len(code):]
++        new = OCC.sub(sub, code)
++        if not seen[i]:
++            out.append(new + comment)
++            continue
++        here = din[i] | f.wr[i]
++        if f.calls[i]:
++            tail = f.tail[i]
++
++            def wrap(kind, target, text):
++                r, m = site(kind, target)
++                if kind == "t":
++                    return "{ " + flush(here, names) + text + " }"
++                if kind == "x":
++                    # ctx holds the registers the guest setjmp saved: every copy comes from it again.
++                    return "{ " + text + reload(f.used, names) + " }"
++                if kind == "s" or (target or "").replace("__imp__", "", 1) in CTX_IMPORTS:
++                    return "{ " + flush(here, names) + text + reload(m & f.used, names) + " }"
++                if tail:
++                    # What the callee reads, and what this function's return has to leave in ctx (the return
++                    # after the call writes nothing back: everything it changes is read back here).
++                    return "{ " + flush(here & (r | at_return), names) + text + reload(m & f.used, names) + " }"
++                fm = here & (r | (m & live_out[i]))
++                if must is not None and kind == "d" and not CHECK:
++                    t = target[len("__imp__"):] if target.startswith("__imp__") else target
++                    if t in defined and t not in hooked and must.get(t):
++                        fm &= ~(must[t] & ~r)
++                fa = fast_of(kind, target) if not tail else None
++                if fa:
++                    t = target[len("__imp__"):] if target.startswith("__imp__") else target
++                    fm &= ~mask(fa)
++                    text = (f"__fast__{t}(ctx, base" +
++                            "".join(f", L_{x}.u64" if x in names else f", ctx.{x}.u64" for x in fa) + ");")
++                back = m & f.used
++                if spkeep and kind == "d" and not CHECK:
++                    t = target[len("__imp__"):] if target.startswith("__imp__") else target
++                    if t in defined and t not in hooked and t in spkeep:
++                        back &= ~(1 << BIT["r1"])
++                if not CHECK:
++                    return "{ " + flush(fm, names) + text + reload(back, names) + " }"
++                # PLR_CHECK=1: the registers not read back must come back unchanged (MOD), and the dirty ones not
++                # written back get a poison value the callee must not use (REF).
++                # Each site has a number (sites[0], the file's base, plus a count): the poison's low word is
++                # 0x5E000000 | number, so a fault on a poisoned address names the site (PLR_MAP lists them).
++                sid = sites["base"] + len(sites["list"])
++                sites["list"].append(f"{sid:06X} {f.name} line {i} calls {target or 'bctrl'}")
++                gp = [x for x in names if x[0] in "rf" and x[1:].isdigit()]
++                poison = [x for x in gp if (here & ~fm) >> BIT[x] & 1]
++                keep = [x for x in gp if not (m >> BIT[x] & 1) and live_out[i] >> BIT[x] & 1]
++                pv = 0x5EAD5EAD00000000 | 0x5E000000 | sid
++                # (and put back after the call: the poison is a change of ctx this function's analysis does not
++                # know about, and a caller trusting ctx to be unchanged there would read it)
++                pre = ""
++                if poison:
++                    pre = "const uint64_t pz_[] = {" + ", ".join(f"ctx.{x}.u64" for x in poison) + "}; "
++                pre += "".join(f"ctx.{x}.u64 = 0x{pv:X}ull; " for x in poison)
++                if keep:
++                    pre += "const uint64_t chk_[] = {" + ", ".join(f"ctx.{x}.u64" for x in keep) + "}; "
++                cond = " || ".join(f"ctx.{x}.u64 != chk_[{k}]" for k, x in enumerate(keep))
++                post = (f" if (__builtin_expect({cond}, 0)) mp3_regcheck_fail(__func__, \"{target or 'bctrl'}\", "
++                        f"0x{sid:X}, \"{' '.join(keep)}\", chk_, &ctx);" if keep else "")
++                unpoison = "".join(f" ctx.{x}.u64 = pz_[{k}];" for k, x in enumerate(poison))
++                return "{ " + flush(fm, names) + pre + text + post + unpoison + reload(m & f.used, names) + " }"
++
++            spans = find_indirect(new)
++            kinds = [k for k, _ in f.calls[i] if k in ("i", "s")]
++            for (a, b), k in reversed(list(zip(spans, kinds))):
++                new = new[:a] + wrap(k, None, new[a:b]) + new[b:]
++            new = CALL.sub(lambda m: wrap("x" if m.group(1) == FIBER else "d", m.group(1), m.group(0)), new)
++            new = TRAP.sub(lambda m: wrap("t", None, m.group(0)), new)
++        if f.returns[i]:
++            fm = here & at_return
++            pz = ret_poison(here, f.calls[i]) if CHECK else ""
++            if fm or pz:
++                new = new.replace("return;", "{ " + flush(fm, names) + pz + "return; }")
++        out.append(new + comment)
++    if seen[n] and (din[n] & at_return or CHECK):
++        tail = flush(din[n] & at_return, names) + ret_poison(din[n], None)
++        if tail:
++            out.append("\t" + tail.rstrip())
++    return out
++
++
++def phase3(args):
++    path, helpers, ref, mod, liveout, hooked, defined, must, spkeep, fast = args
++    lines, funcs = parse_file(path, helpers)
++    m = re.search(r"_recomp\.(\d+)\.cpp$", path)  # vig8: vig8_recomp.N.cpp
++    sites = {"base": (int(m.group(1)) if m else 255) << 16, "list": []}
++    out = []
++    last = 0
++    done = skipped = 0
++    fast_here = 0
++    for name, a, b, f in funcs:
++        new = None
++        if f is not None and f.ok:
++            new = rewrite(f, ref, mod, liveout, hooked, defined, sites, must, spkeep, fast)
++            done += 1
++        elif f is not None:
++            skipped += 1
++        args_f = fast.get(name) if new is not None else None
++        if args_f:
++            fast_here += 1
++            out.extend(lines[last:a])
++            params = "".join(f", uint64_t a_{x}" for x in args_f)
++            out.append(f'extern "C" void __fast__{name}([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base{params}) {{')
++            out.extend(new)
++            out.append("}")
++            out.append(f"DEFINE_REX_FUNC({name}) {{")
++            out.append("\tREX_FUNC_PROLOGUE();")
++            out.append(f"\t__fast__{name}(ctx, base" + "".join(f", ctx.{x}.u64" for x in args_f) + ");")
++            last = b  # its closing brace comes next
++            continue
++        out.extend(lines[last:a + 1])
++        out.extend(new if new is not None else lines[a + 1:b])
++        last = b
++    out.extend(lines[last:])
++    if fast:
++        for k, l in enumerate(out):
++            if l.startswith("#include"):
++                out.insert(k + 1, '#include "vig8_fast.h"')
++                break
++    open(path, "w", encoding="utf-8", errors="surrogateescape").write("\n".join(out))
++    return done, skipped, sites["list"]
++
++
++def main(argv):
++    if "--" not in argv:
++        sys.exit(__doc__)
++    i = argv.index("--")
++    helpers = load_helpers(argv[0])
++    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++    from patch_inline_calls import defined_names, hooked_names
++    files = argv[i + 1:]
++    # The functions the sources name: hooked (a strong symbol of that name replaces the alias) or called from native
++    # code (__imp__<name>). Either way native code is on one side of the call.
++    hooked = hooked_names(argv[1:i], defined_names(files))
++    if any("L_r1" in open(p, encoding="utf-8", errors="surrogateescape").read() for p in files[:1]):
++        print("patch_local_regs: already applied")
++        return 0
++    with ProcessPoolExecutor(max_workers=os.cpu_count()) as ex:
++        summ = {}
++        for part in ex.map(phase1, [(p, helpers) for p in files]):
++            summ.update(part)
++        ref, mod = fixpoint(summ, hooked)
++        defined = set(summ)
++        native = hooked
++        liveout = fixpoint_liveout(summ, ref, mod, hooked, defined, native)
++        must = fixpoint_must(summ, hooked) if os.environ.get("PLR_MUST", "1") == "1" else {}
++        nmust = sum(1 for v in must.values() if v)
++        fast = {}
++        if FASTARGS:
++            # Every function any of the port's other native code names (Renut's D3D hooks: mp3/renut) keeps its ctx
++            # entry for every caller: its sub_ symbol may be replaced by native code.
++            named = set()
++            here = os.path.dirname(os.path.abspath(__file__))
++            for d in [os.path.join(here, "..", "renut")] + os.environ.get("PLR_EXTRA_HOOK_DIRS", "").split(":"):
++                if not d or not os.path.isdir(d):
++                    continue
++                for root, _, fs in os.walk(d):
++                    for fn in fs:
++                        if fn.endswith((".cpp", ".h", ".hpp", ".inc", ".c")):
++                            text = open(os.path.join(root, fn), encoding="utf-8", errors="replace").read()
++                            named.update(re.findall(r"\bsub_[0-9A-F]{8}\b", text))
++            print(f"patch_local_regs: FASTARGS: {len(named)} functions named in native sources keep the ctx entry",
++                  file=sys.stderr)
++            for name, s in summ.items():
++                if s is None or name in hooked or name in named:
++                    continue
++                a = [x for x in FAST_GPRS if ref[name] >> BIT[x] & 1 and s["used"] >> BIT[x] & 1]
++                if a:
++                    fast[name] = a
++            hdr = os.path.join(os.path.dirname(os.path.abspath(files[0])), "vig8_fast.h")
++            with open(hdr, "w") as fo:
++                fo.write("// Written by patch_local_regs.py (FASTARGS): the guest functions' fast entries.\n#pragma once\n")
++                for name, a in sorted(fast.items()):
++                    fo.write(f'extern "C" void __fast__{name}(PPCContext& __restrict, uint8_t*' +
++                             ", uint64_t" * len(a) + ");\n")
++            print(f"patch_local_regs: FASTARGS: {len(fast)} functions take their arguments by value", file=sys.stderr)
++        spkeep = ({k for k, s in summ.items() if s is not None and s.get("sp_keep")}
++                  if os.environ.get("PLR_SPKEEP", "1") == "1" else set())
++        print(f"patch_local_regs: SPKEEP: {len(spkeep)} functions give r1 back as they got it", file=sys.stderr)
++        print(f"patch_local_regs: MUST: {nmust} functions replace registers on every path", file=sys.stderr)
++        if os.environ.get("PLR_DUMP"):
++            import pickle
++            pickle.dump({"ref": ref, "mod": mod, "liveout": liveout,
++                         "pres": {k: v["pres"] for k, v in summ.items() if v}},
++                        open(os.environ["PLR_DUMP"], "wb"))
++        done = skipped = 0
++        site_list = []
++        for d, s, sl in ex.map(phase3, [(p, helpers, ref, mod, liveout, hooked, defined, must, spkeep, fast) for p in files]):
++            done += d
++            skipped += s
++            site_list.extend(sl)
++        if CHECK and os.environ.get("PLR_MAP"):
++            with open(os.environ["PLR_MAP"], "w") as fo:
++                fo.write("\n".join(site_list) + "\n")
++    nv_ref = sum(1 for k, v in ref.items() if summ.get(k) and v & NONVOL & ~mask(["r1", "r13"]))
++    if os.environ.get("PLR_DEBUG"):
++        odd = {k: v & ~ABI_REF for k, v in ref.items() if summ.get(k) and v & ~ABI_REF}
++        with open(os.environ["PLR_DEBUG"], "w") as fo:
++            for k, v in sorted(odd.items()):
++                fo.write(k + " " + " ".join(r for r in NAMES if v >> BIT[r] & 1) + "\n")
++    print(f"patch_local_regs: {done} functions with registers in locals, {skipped} left as they were; "
++          f"{nv_ref} functions read a caller's non-volatile register")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/project/tools/patch_phys_base.py b/project/tools/patch_phys_base.py
+new file mode 100755
+index 0000000..31bb27e
+--- /dev/null
++++ b/project/tools/patch_phys_base.py
+@@ -0,0 +1,33 @@
++#!/usr/bin/env python3
++"""mp3-ps4 (v00.47): the guest's register + displacement accesses take the 0xE0000000 heap's host offset from the
++base register: REX_LOAD_U32_B(L_r31.u32, 448) for REX_LOAD_U32(L_r31.u32 + 448), so the compiler checks a pointer
++once for every access through it instead of once per access.
++
++On the PS4 the 0xE0000000 heap sits 4 KiB further in host memory (REX_PHYS_HOST_OFFSET, make_ps4_pch.py a), and the
++check was four x86 instructions on every guest load and store (xor, cmp, setae, shl: ~13 % of the converted code,
++and registers spilled to hold the offsets): the register + displacement form is ~707,000 of the game's ~805,000
++accesses (the stack's, r1, are already REX_SLOAD/REX_SSTORE without it: patch_stack_access.py). A base register and
++the address it reaches lie on the same side of 0xE0000000 unless an object straddles two of the console's views,
++which its memory map does not allow (the 0xC0000000 view ends there; the 0xE0000000 one starts at physical 0x1000);
++the one constant 0xE0000000 in the game (lis r8,-8192 in sub_823A2F28) only takes part in a comparison. Indexed
++(register + register) accesses keep the check on the whole address. The macros: make_ps4_pch.py e.
++
++Run after patch_local_regs.py (it reads the generated text). Idempotent. Usage: patch_phys_base.py <generated .cpp>
++"""
++import re
++import sys
++
++PATTERN = re.compile(r"REX_(LOAD|STORE)_U(8|16|32|64)\((L_r\d+\.u32) \+ (-?\d+)([,)])")
++
++files = sites = 0
++for path in sys.argv[1:]:
++    text = open(path, encoding="utf-8").read()
++    new, n = PATTERN.subn(lambda m: f"REX_{m.group(1)}_U{m.group(2)}_B({m.group(3)}, {m.group(4)}{m.group(5)}", text)
++    if not n:
++        continue
++    with open(path, "w", encoding="utf-8", newline="\n") as f:
++        f.write(new)
++    files += 1
++    sites += n
++print(f"patch_phys_base: {sites} register + displacement accesses take the heap offset from their base register "
++      f"in {files} files")
+diff --git a/project/tools/patch_stack_access.py b/project/tools/patch_stack_access.py
+new file mode 100755
+index 0000000..8d83387
+--- /dev/null
++++ b/project/tools/patch_stack_access.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""Guest stack accesses without volatile (make_nx_pch.py, point 6).
++
++REX_LOAD_*/REX_STORE_* go through volatile pointers, so the compiler keeps every guest memory access as written: a
++local spilled to the guest stack and read back at once is still a store and a load, and the register save/restore
++helpers cannot pair their stores. The guest stack (r1) belongs to one thread, so accesses at ctx.r1.u32 (and, inside
++the __savefpr_/__restfpr_/__savevmx_/__restvmx_ helpers, at ctx.r12.u32, which points into the caller's frame there)
++become REX_SLOAD_*/REX_SSTORE_*: plain, alias-safe accesses (memcpy) the compiler may keep in registers or combine.
++
++Usage: patch_stack_access.py generated/default/*.cpp   (idempotent)
++"""
++
++import re
++import sys
++
++STACK = re.compile(r"\bREX_(LOAD|STORE)_U(8|16|32|64)\(ctx\.r1\.u32\b")
++HELPER_R12 = re.compile(r"\bREX_(LOAD|STORE)_U(8|16|32|64)\(ctx\.r12\.u32\b")
++HELPER = re.compile(r"^DEFINE_REX_FUNC\(__(save|rest)(fpr|vmx)_\d+\)")
++
++
++def patch(path):
++    with open(path, encoding="utf-8", errors="surrogateescape") as f:
++        lines = f.readlines()
++    changed = 0
++    in_helper = False
++    for i, line in enumerate(lines):
++        if line.startswith("DEFINE_REX_FUNC("):
++            in_helper = bool(HELPER.match(line))
++        new, n = STACK.subn(r"REX_S\1_U\2(ctx.r1.u32", line)
++        if in_helper:
++            new, m = HELPER_R12.subn(r"REX_S\1_U\2(ctx.r12.u32", new)
++            n += m
++        if n:
++            lines[i] = new
++            changed += n
++    if changed:
++        with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
++            f.writelines(lines)
++    return changed
++
++
++def main(paths):
++    total = sum(patch(p) for p in paths)
++    print(f"patch_stack_access: {total} guest stack accesses without volatile")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/project/tools/patch_vmx_exact.py b/project/tools/patch_vmx_exact.py
+new file mode 100755
+index 0000000..5df001d
+--- /dev/null
++++ b/project/tools/patch_vmx_exact.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""Vector instructions of ReXGlue v0.10.0's code made to compute what the console computes.
++
++- vmaddfp / vnmsubfp: the codegen writes a*b + c and -(a*b - c) with two roundings; the console's VMX fuses them
++  (one rounding). Liberty Recompiled and this repository's Vulkan build (source/) build GTA IV with the fused form
++  (REX_FUSED_VMADDFP, simde's fmadd / fnmadd: fmla / fmls on the Switch). Written as REX_VMADDFP / REX_VNMSUBFP,
++  defined in the PCH (tools/make_nx_pch.py, point 10).
++- vpkuwus: the codegen writes it as eight scalar stores into vD, so when vD is also vA or vB a lane is overwritten
++  before it is read. One vector expression instead (Liberty Recompiled's fix): clamp to 0xFFFF, then pack.
++
++usage: patch_vmx_exact.py <generated .cpp>...
++"""
++import re
++import sys
++
++LOAD = r"simde_mm_load_ps\(([A-Za-z_0-9.]+)\)"
++MADD = re.compile(r"simde_mm_add_ps\(simde_mm_mul_ps\(%s, %s\), %s\)" % (LOAD, LOAD, LOAD))
++NMSUB = re.compile(
++    r"simde_mm_xor_ps\(simde_mm_sub_ps\(simde_mm_mul_ps\(%s, %s\), %s\), "
++    r"simde_mm_castsi128_ps\(simde_mm_set1_epi32\(int\(0x80000000\)\)\)\)" % (LOAD, LOAD, LOAD))
++# Eight lines: vD.u16[7-i] from vA.u32[3-i] and vD.u16[3-i] from vB.u32[3-i], i = 0..3.
++LANE = r"\t(?P<d{n}>[A-Za-z_0-9.]+)\.u16\[{h}\] = (?P<s{n}>[A-Za-z_0-9.]+)\.u32\[{w}\] > 0xFFFF \? 0xFFFF : \(uint16_t\)(?P=s{n})\.u32\[{w}\];\n"
++PKUWUS = re.compile("".join(LANE.format(n=2 * i, h=7 - i, w=3 - i) + LANE.format(n=2 * i + 1, h=3 - i, w=3 - i)
++                            for i in range(4)))
++
++
++def pkuwus(m):
++    d = {m.group("d%d" % k) for k in range(8)}
++    a = {m.group("s%d" % k) for k in range(0, 8, 2)}
++    b = {m.group("s%d" % k) for k in range(1, 8, 2)}
++    if len(d) != 1 or len(a) != 1 or len(b) != 1:
++        return m.group(0)
++    d, a, b = d.pop(), a.pop(), b.pop()
++    return ("\tsimde_mm_store_si128((simde__m128i*){d}.u16, simde_mm_packus_epi32("
++            "simde_mm_min_epu32(simde_mm_load_si128((simde__m128i*){b}.u32), simde_mm_set1_epi32(0xFFFF)), "
++            "simde_mm_min_epu32(simde_mm_load_si128((simde__m128i*){a}.u32), simde_mm_set1_epi32(0xFFFF))));\n"
++            ).format(d=d, a=a, b=b)
++
++
++totals = [0, 0, 0]
++for path in sys.argv[1:]:
++    text = open(path, encoding="utf-8").read()
++    text, n1 = MADD.subn(r"REX_VMADDFP(simde_mm_load_ps(\1), simde_mm_load_ps(\2), simde_mm_load_ps(\3))", text)
++    text, n2 = NMSUB.subn(r"REX_VNMSUBFP(simde_mm_load_ps(\1), simde_mm_load_ps(\2), simde_mm_load_ps(\3))", text)
++    text, n3 = PKUWUS.subn(pkuwus, text)
++    if n1 or n2 or n3:
++        open(path, "w", encoding="utf-8").write(text)
++    totals = [totals[0] + n1, totals[1] + n2, totals[2] + n3]
++print("patch_vmx_exact: %d vmaddfp, %d vnmsubfp fused; %d vpkuwus as one expression" % tuple(totals))
+diff --git a/project/tools/prepare_tree.py b/project/tools/prepare_tree.py
+new file mode 100644
+index 0000000..a10e252
+--- /dev/null
++++ b/project/tools/prepare_tree.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""Mirror the generated code (codegen/generated/default/) for the PS4 build (from mp3-nx's tools/prepare_tree.py).
++
++The generated files include "vig8_pch.h" with quotes, which always finds the copy next to the includer first. So the
++PS4 build compiles a mirror of the tree made of symlinks, where only the PCH is replaced by the PS4 one
++(make_ps4_pch.py).
++
++Usage: prepare_tree.py <generated/default> <out_dir> [PCH script, default make_ps4_pch.py] [PCH name, vig8_pch.h]
++"""
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++src = Path(sys.argv[1]).resolve()
++out = Path(sys.argv[2]).resolve()
++here = Path(__file__).resolve().parent
++pch_tool = Path(sys.argv[3]) if len(sys.argv) > 3 else here / "make_ps4_pch.py"
++PCH = sys.argv[4] if len(sys.argv) > 4 else "vig8_pch.h"
++
++n = 0
++for root, dirs, files in os.walk(src):
++    rel = Path(root).relative_to(src)
++    (out / rel).mkdir(parents=True, exist_ok=True)
++    for f in files:
++        if rel == Path(".") and f == PCH:
++            continue
++        link = out / rel / f
++        target = Path(root) / f
++        if link.is_symlink() or link.exists():
++            if link.is_symlink() and Path(os.readlink(link)) == target:
++                continue
++            link.unlink()
++        link.symlink_to(target)
++        n += 1
++subprocess.check_call([sys.executable, "-I", str(pch_tool), str(src / PCH), str(out / PCH)])
++print(f"{n} links in {out}")
+diff --git a/project/tools/ps4_unfused_fma.py b/project/tools/ps4_unfused_fma.py
+new file mode 100755
+index 0000000..30be816
+--- /dev/null
++++ b/project/tools/ps4_unfused_fma.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++"""mp3-ps4: the guest's fused multiply-adds as REX_FMA (from the MGR port's tools/ps4_unfused_fma.py).
++
++The generator writes PPC's fmadd family (fmadd, fmsub, fnmadd, fnmsub and their single forms) as std::fma. The PS4's
++Jaguar has no FMA instruction, so std::fma is libm's software emulation: in the MGR port's first console profile a
++third of an audio thread. REX_FMA (tools/make_ps4_pch.py) is a multiply and an add there. For single-precision
++operands the result is the fused one (the product of two 24-bit mantissas is exact in a double, so the double add
++rounds once, as std::fma does); double-precision operands can differ in the last bit, as on Xenia without FMA.
++
++tools/codegen.sh runs it in its staging folder when PS4=1, before the changed files are copied over generated/.
++Idempotent.  Usage: ps4_unfused_fma.py <generated .cpp files>
++"""
++import sys
++
++files = sites = 0
++for path in sys.argv[1:]:
++    text = open(path, encoding="utf-8").read()
++    n = text.count("std::fma(")
++    if not n:
++        continue
++    with open(path, "w", encoding="utf-8", newline="\n") as f:
++        f.write(text.replace("std::fma(", "REX_FMA("))
++    files += 1
++    sites += n
++print(f"ps4_unfused_fma: {sites} std::fma calls as REX_FMA in {files} files")
+diff --git a/project/vig8_manifest.toml b/project/vig8_manifest.toml
+index 981aa87..373a24f 100644
+--- a/project/vig8_manifest.toml
++++ b/project/vig8_manifest.toml
+@@ -47,3 +47,12 @@ includes = []
+ 0x82176178 = { name = "sub_82176178", size = 8 }
+ 0x82176190 = { name = "sub_82176190", size = 8 }
+ 0x821C6470 = { name = "sub_821C6470", size = 8 }
++
++# vig8-ps4 (2026-11-24): callbacks reached only through a pointer the code builds with lis + addi, found ahead of the
++# first console run by MP3-PS4's tools/scan_missed_functions.py and checked by hand (the scan's two other finds,
++# 0x820E8B00 and 0x821A1B60, are branch targets inside their own functions).
++# `b 0x820F03C0`, stored at +0xC of an object by 0x820F5F20; its neighbours 0x820F0B98 and 0x820F0BA0 (the same stub,
++# built by 0x820F5F80 and 0x820F5FE0) are found by the codegen.
++0x820F0B90 = { name = "sub_820F0B90", size = 4 }
++# `blr`: an empty callback 0x8232D530 passes to 0x823116E0 (an atexit-style registration).
++0x8232E260 = { name = "sub_8232E260", size = 4 }

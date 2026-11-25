@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.png binary
+*.ttf binary
+*.pkg binary
+# (the patches carry upstream's lines as they are, CRLF ones included)
+*.patch -text

@@ -1,0 +1,15 @@
+# Only what the build needs is in the repository (an allow-list). Your game and its DLC (584108A8/), the packages you
+# build (out/: they hold your game), logs, clips and your own pictures (sce_sys/local/, art/) stay out.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/CREDITS.md
+!/LICENSE
+!/docs/
+!/patches/
+!/scripts/
+!/sce_sys/
+!/tools/
+/sce_sys/local/
+__pycache__/

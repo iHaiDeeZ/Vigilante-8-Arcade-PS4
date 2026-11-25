@@ -1,0 +1,1755 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 7601515..1c89806 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -75,6 +75,10 @@ enum class GammaRampType {
+ 
+ // mp3-ps4 (v00.20): the command processor thread's core (gpu_commands_core), -1 = not pinned by it.
+ int CommandProcessorCore();
++// vig8-ps4 (v00.09): gpu_commands_core_cycle - whether it lists two cores or more, and the step to its next core (the
++// stats line, at the end of a period).
++bool CommandProcessorCoreCycling();
++void AdvanceCommandProcessorCoreCycle();
+ // mp3-ps4 (v00.21): on the command processor thread: pins it as gpu_commands_core says when that has changed (at the
+ // start and at each frame).
+ void ApplyCommandProcessorCore();
+@@ -95,6 +99,11 @@ class CommandProcessor {
+ 
+   Shader* active_vertex_shader() const { return active_vertex_shader_; }
+   Shader* active_pixel_shader() const { return active_pixel_shader_; }
++  // vig8-ps4 (v00.09): register value changes since the last draw outside the shader constants and the draw's own
++  // registers, whether fetch constants changed, and the last draw's shaders (IssueDraw's same-state count).
++  uint32_t state_changes_since_draw_ = 0;
++  bool fetch_changed_since_draw_ = false;
++  const Shader* last_draw_shaders_[2] = {};
+ 
+   virtual bool Initialize();
+   virtual void Shutdown();
+@@ -190,6 +199,9 @@ class CommandProcessor {
+   bool ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+   bool ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+   bool ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
++  // vig8-ps4: the primary ring's reader while ExecutePrimaryBuffer runs (an INDIRECT_BUFFER read from it publishes
++  // the read pointer before the buffer runs).
++  memory::RingBuffer* primary_reader_ = nullptr;
+   bool ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader, uint32_t packet,
+                                           uint32_t count);
+   bool ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+@@ -275,6 +287,25 @@ class CommandProcessor {
+   Shader* active_vertex_shader_ = nullptr;
+   Shader* active_pixel_shader_ = nullptr;
+ 
++  // vig8-ps4 (v00.08, gpu_shader_load_cache): IM_LOAD's shaders by guest address, with the microcode as the guest
++  // had it: a load whose bytes are the same (memcmp) skips hashing them and the shader map. Shaders live until
++  // shutdown; emptied with the caches anyway.
++  struct ShaderLoadCacheEntry {
++    uint32_t address = 0;
++    uint32_t dword_count = 0;
++    uint32_t type = 0;
++    Shader* shader = nullptr;
++    std::vector<uint32_t> guest_dwords;
++  };
++  static constexpr uint32_t kShaderLoadCacheSize = 512;
++  std::vector<ShaderLoadCacheEntry> shader_load_cache_ =
++      std::vector<ShaderLoadCacheEntry>(kShaderLoadCacheSize);
++  void ResetShaderLoadCache() {
++    for (ShaderLoadCacheEntry& entry : shader_load_cache_) {
++      entry.shader = nullptr;
++    }
++  }
++
+   bool paused_ = false;
+ 
+   // By default (such as for tools), post-processing is disabled.
+diff --git a/include/rex/graphics/cp_perf.h b/include/rex/graphics/cp_perf.h
+index 6d140c7..a2730e5 100644
+--- a/include/rex/graphics/cp_perf.h
++++ b/include/rex/graphics/cp_perf.h
+@@ -67,9 +67,39 @@ inline std::atomic<uint64_t> float_written{0};
+ inline std::atomic<uint64_t> float_changed{0};
+ inline std::atomic<uint64_t> fetch_written{0};
+ inline std::atomic<uint64_t> fetch_changed{0};
++// vig8-ps4: WAIT_REG_MEM packets - how many, how many had to wait, the time they waited - and the last one that waited
++// ((is_memory << 63) | (function << 56) | address; (mask << 32) | reference).
++inline std::atomic<uint64_t> wait_reg_mem{0};
++inline std::atomic<uint64_t> wait_reg_mem_waited{0};
++inline std::atomic<uint64_t> wait_reg_mem_ticks{0};
++inline std::atomic<uint64_t> wait_reg_mem_last_key{0};
++inline std::atomic<uint64_t> wait_reg_mem_last_ref{0};
++inline std::atomic<uint64_t> vblanks{0};        // vig8-ps4: guest vblank interrupts (MarkVblank)
++inline std::atomic<uint64_t> shader_load_hits{0};        // vig8-ps4 (v00.08): IM_LOADs from the address cache
++inline std::atomic<uint64_t> rt_updates_skipped{0};      // vig8-ps4 (v00.08): gpu_rt_update_skip
++inline std::atomic<uint64_t> texture_sets_last_hits{0};  // vig8-ps4 (v00.08): the stage's last set, no hash
++inline std::atomic<uint64_t> vblanks_early{0};  // vig8-ps4: of them, brought forward to a command processor wait
++// vig8-ps4 (v00.09): occlusion query events and visibility queries (both reported visible), conditional draws (all
++// drawn), the draws that found the state of the draw before them with the same shaders (only shader constants
++// changed; or fetch constants too), and sampler parameters answered by the memo.
++inline std::atomic<uint64_t> zpd_events{0};
++inline std::atomic<uint64_t> viz_queries{0};
++inline std::atomic<uint64_t> conditional_draws{0};
++inline std::atomic<uint64_t> draws_same_state{0};
++inline std::atomic<uint64_t> draws_same_but_fetch{0};
++inline std::atomic<uint64_t> sampler_memo_hits{0};
++inline std::atomic<uint64_t> sampler_lookups{0};
++// vig8-ps4 (v00.10): predicated tiling - screen extent events (EVENT_WRITE_EXT, one after each draw while a game tiles)
++// and the predicated packets the bin masks left out (with the SDK's whole-screen extents, only a tile pass's own
++// resolves and the like).
++inline std::atomic<uint64_t> extent_events{0};
++inline std::atomic<uint64_t> predicated_skipped{0};
+ 
++// vig8-ps4 (v00.09): added without a locked instruction - lock xadd drains the store buffer (~20 cycles on Jaguar)
++// and a draw added ~30 counters. Each counter has one writer in practice (the command processor; the vsync thread for
++// the vblanks); a rare lost update only blurs a statistic.
+ inline void Add(std::atomic<uint64_t>& counter, uint64_t value) {
+-  counter.fetch_add(value, std::memory_order_relaxed);
++  counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
+ }
+ 
+ struct ScopeTicks {
+@@ -83,6 +113,32 @@ struct ScopeTicks {
+   uint64_t start_;
+ };
+ 
++// vig8-ps4 (v00.09): a draw's part timers ([cpt2] and [cpt3]) run in one draw of kPartSampleEvery. rdtsc costs ~40
++// cycles on Jaguar and a draw read it ~28 times (~0.5 us of ~9 us); BeginDraw (IssueDraw, command processor thread)
++// picks the timed draws and the stats multiply the parts by kPartSampleEvery.
++inline constexpr uint32_t kPartSampleEvery = 16;
++inline std::atomic<bool> part_timing{true};
++inline uint32_t part_draw_counter = 0;  // the command processor thread only
++inline void BeginDraw() {
++  part_timing.store((++part_draw_counter & (kPartSampleEvery - 1)) == 0, std::memory_order_relaxed);
++}
++inline uint64_t PartTicks() { return part_timing.load(std::memory_order_relaxed) ? Ticks() : 0; }
++inline void AddPart(std::atomic<uint64_t>& counter, uint64_t start) {
++  if (start) {
++    Add(counter, Ticks() - start);
++  }
++}
++struct ScopePartTicks {
++  explicit ScopePartTicks(std::atomic<uint64_t>& sink) : sink_(sink), start_(PartTicks()) {}
++  ~ScopePartTicks() { AddPart(sink_, start_); }
++  ScopePartTicks(const ScopePartTicks&) = delete;
++  ScopePartTicks& operator=(const ScopePartTicks&) = delete;
++
++ private:
++  std::atomic<uint64_t>& sink_;
++  uint64_t start_;
++};
++
+ // The global lock, with the wait timed when another thread holds it.
+ inline std::unique_lock<std::recursive_mutex> AcquireTimed(std::recursive_mutex& mutex) {
+   std::unique_lock<std::recursive_mutex> lock(mutex, std::try_to_lock);
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index ac6b056..edb247b 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -14,6 +14,7 @@
+ #include "rex/system/function_dispatcher.h"
+ 
+ #include <atomic>
++#include <condition_variable>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -77,6 +78,11 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
+   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
+ 
++  // vig8-ps4 (vblank_at_gpu_wait): a command processor wait that has not matched asks for the coming guest vblank
++  // now (any thread; at most one vblank a refresh still), and takes the request back once it matched.
++  void RequestEarlyVblank();
++  void CancelEarlyVblank() { early_vblank_requested_.store(false, std::memory_order_release); }
++
+   virtual void ClearCaches();
+   virtual void InvalidateGpuMemory();
+ 
+@@ -119,6 +125,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   uint32_t interrupt_callback_data_ = 0;
+ 
+   std::atomic<bool> vsync_worker_running_;
++  std::atomic<bool> early_vblank_requested_{false};  // vig8-ps4 (RequestEarlyVblank)
++  std::mutex vblank_wake_mutex_;
++  std::condition_variable vblank_wake_cv_;
+   system::object_ref<system::XHostThread> vsync_worker_thread_;
+ 
+   RegisterFile register_file_;
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 3bbd52e..25f4887 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -487,7 +487,10 @@ class RenderTargetCache {
+   // false).
+   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
+ 
+-  void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
++  void ResetAccumulatedRenderTargets() {
++    are_accumulated_render_targets_valid_ = false;
++    ++update_epoch_;  // vig8-ps4 (v00.08)
++  }
+   RenderTarget* const* last_update_accumulated_render_targets() const {
+     assert_true(GetPath() == Path::kHostRenderTargets);
+     return last_update_accumulated_render_targets_;
+@@ -548,6 +551,11 @@ class RenderTargetCache {
+   // EDRAM memory are committed with a memory barrier.
+   void PixelShaderInterlockFullEdramBarrierPlaced();
+ 
++  // vig8-ps4 (v00.08, gpu_rt_update_skip): changes whenever something may have changed the render targets, their
++  // ownership or their use (ownership changes, transfers, resolves, dumps, clears, a new frame). An update captures it
++  // after its own changes; the next draw's update may be skipped only if it is still the same.
++  uint64_t update_epoch_ = 0;
++
+  private:
+   const RegisterFile& register_file_;
+   uint32_t draw_resolution_scale_x_;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 3efce82..55ec41f 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -141,8 +141,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+                                bool blocking) override;
+ 
+   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
+-    return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
+-        ->vulkan_device();
++    // vig8-ps4 (v00.09): looked up once - a virtual call and two loads, ~20 times a draw; the device lives as long as
++    // the provider.
++    ui::vulkan::VulkanDevice* device = vulkan_device_cache_.load(std::memory_order_relaxed);
++    if (!device) {
++      device = static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())->vulkan_device();
++      vulkan_device_cache_.store(device, std::memory_order_relaxed);
++    }
++    return device;
+   }
+ 
+   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
+@@ -531,6 +537,18 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::unordered_map<uint64_t, TextureSetCacheEntry> texture_set_cache_;
+   std::vector<VkDescriptorImageInfo> texture_set_cache_infos_;
+   uint64_t texture_set_cache_destructions_ = 0;
++  // vig8-ps4 (v00.08): the set each stage (0 pixel, 1 vertex) found or wrote last, checked before hashing (more than
++  // half the draws keep it); valid while texture_set_cache_generation_ is the same (bumped at every clear).
++  struct LastTextureSet {
++    uint64_t generation = UINT64_MAX;
++    uint64_t hash = 0;
++    VkDescriptorSet set = VK_NULL_HANDLE;
++    uint32_t layout_key = 0;
++    uint32_t info_count = 0;
++    size_t info_offset = 0;
++  };
++  LastTextureSet last_texture_set_[2];
++  uint64_t texture_set_cache_generation_ = 0;
+ 
+   bool device_lost_ = false;
+ 
+@@ -681,6 +699,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+     }
+   };
+   bool dynamic_constants_ = false;
++  mutable std::atomic<ui::vulkan::VulkanDevice*> vulkan_device_cache_{nullptr};  // vig8-ps4 (v00.09)
+   std::unordered_map<ConstantsSetKey, VkDescriptorSet, ConstantsSetKeyHasher> constants_dynamic_sets_;
+   uint32_t current_constant_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferCount] = {};
+   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f7033..8810988 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -280,6 +280,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   const RenderTarget* const*
+       last_update_framebuffer_attachments_[1 + xenos::kMaxColorRenderTargets] = {};
+   const Framebuffer* last_update_framebuffer_ = VK_NULL_HANDLE;
++  // vig8-ps4 (v00.08, gpu_rt_update_skip): what the last full update was given - the registers it and the draw
++  // extent estimate read, and its arguments - and update_epoch_ after it.
++  struct UpdateShortcutKey {
++    uint32_t values[20];
++    bool operator==(const UpdateShortcutKey& other) const {
++      return !std::memcmp(values, other.values, sizeof(values));
++    }
++  };
++  UpdateShortcutKey last_full_update_key_{};
++  uint64_t last_full_update_epoch_ = UINT64_MAX;
+ 
+   // For host render targets.
+ 
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 04856ee..30f1874 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -376,6 +376,18 @@ class VulkanTextureCache final : public TextureCache {
+   xenos::AnisoFilter max_anisotropy_;
+ 
+   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher> samplers_;
++  // vig8-ps4 (v00.09): GetSamplerParameters' results by their inputs (direct-mapped), and the samplers UseSampler
++  // found last by their parameters, ahead of the map (emptied whenever a sampler is destroyed).
++  struct SamplerParametersMemo {
++    uint32_t fetch[6];
++    uint32_t binding_key;  // 0: empty
++    SamplerParameters parameters;
++  };
++  static constexpr uint32_t kSamplerParametersMemoSize = 256;
++  mutable SamplerParametersMemo sampler_parameters_memo_[kSamplerParametersMemoSize] = {};
++  static constexpr uint32_t kSamplerMruSizeLog2 = 6;
++  std::pair<const SamplerParameters, Sampler>* sampler_mru_[1u << kSamplerMruSizeLog2] = {};
++  SamplerParameters GetSamplerParametersUncached(const VulkanShader::SamplerBinding& binding) const;
+   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;
+   std::pair<const SamplerParameters, Sampler>* sampler_used_last_ = nullptr;
+   uint32_t custom_border_color_sampler_count_ = 0;
+diff --git a/include/rex/kernel/xam/ui_hooks.h b/include/rex/kernel/xam/ui_hooks.h
+new file mode 100644
+index 0000000..e3319b3
+--- /dev/null
++++ b/include/rex/kernel/xam/ui_hooks.h
+@@ -0,0 +1,12 @@
++// vig8-ps4: hooks an app sets into the SDK's XAM user interface.
++
++#pragma once
++
++namespace rex::kernel::xam {
++
++// XamShowAchievementsUI / XamShowAchievementsUIEx (the title's "Achievements" menu item) call this, if set, on the
++// game's thread (the console showed its achievements list; vig8-ps4 opens its quick menu's ACHIEVEMENTS tab). The
++// call returns success either way, as the stub did.
++void SetShowAchievementsUiHook(void (*hook)());
++
++}  // namespace rex::kernel::xam
+diff --git a/include/rex/kernel/xboxkrnl/video.h b/include/rex/kernel/xboxkrnl/video.h
+index 0b9bd41..0ef8cb3 100644
+--- a/include/rex/kernel/xboxkrnl/video.h
++++ b/include/rex/kernel/xboxkrnl/video.h
+@@ -31,4 +31,8 @@ void VdQueryVideoMode(system::X_VIDEO_MODE* video_mode);
+ void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
+                           system::KernelState* kernel_state);
+ 
++// vig8-ps4: called on the game's thread at each VdSwap (one per frame the game presents), before the swap is queued
++// for the GPU; for an app's frame counter and freeze report. nullptr removes it.
++void SetGuestSwapHook(void (*hook)());
++
+ }  // namespace rex::kernel::xboxkrnl
+diff --git a/include/rex/math.h b/include/rex/math.h
+index ab7960f..ba83ccd 100644
+--- a/include/rex/math.h
++++ b/include/rex/math.h
+@@ -167,8 +167,20 @@ inline uint8_t tzcnt(int64_t v) {
+ // Search the value from least significant bit (LSB) to the most significant bit
+ // (MSB) for a set bit (1).
+ // Returns false if no bits are set and the output index is invalid.
++#if defined(__GNUC__) || defined(__clang__)
++// vig8-ps4 (v00.09): inline - the command processor's mask loops called the out-of-line ones (~1 % of its time).
++inline bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
++  *out_first_set_index = v ? uint32_t(__builtin_ctz(v)) : UINT32_MAX;
++  return v != 0;
++}
++inline bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
++  *out_first_set_index = v ? uint32_t(__builtin_ctzll(v)) : UINT32_MAX;
++  return v != 0;
++}
++#else
+ bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index);
+ bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index);
++#endif
+ inline bool bit_scan_forward(int32_t v, uint32_t* out_first_set_index) {
+   return bit_scan_forward(static_cast<uint32_t>(v), out_first_set_index);
+ }
+diff --git a/src/core/math_gcc.cpp b/src/core/math_gcc.cpp
+index 1ec7192..e694c2a 100644
+--- a/src/core/math_gcc.cpp
++++ b/src/core/math_gcc.cpp
+@@ -33,15 +33,6 @@ uint8_t tzcnt(uint64_t v) {
+   return v == 0 ? 64 : static_cast<uint8_t>(__builtin_ctzll(v));
+ }
+ 
+-bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+-  int i = ffs(v);
+-  *out_first_set_index = i - 1;
+-  return i != 0;
+-}
+-bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
+-  int i = __builtin_ffsll(v);
+-  *out_first_set_index = i - 1;
+-  return i != 0;
+-}
++// bit_scan_forward: inline in math.h (vig8-ps4 v00.09).
+ 
+ }  // namespace rex
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a28e6bb..4ab7f15 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -50,6 +50,26 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+ 
+ REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++// vig8-ps4: the guest's WAIT_REG_MEM packets made the command processor sleep wait/0x100 ms at a time (Xenia's), 1 ms or
++// more on the PS4, however soon the value came: 25 % of its time in Vigilante 8's gameplay, while the game's main thread
++// spun waiting for the GPU's read pointer. The command processor has a core of its own; it looks again sooner.
++REXCVAR_DECLARE(bool, vblank_at_gpu_wait);  // graphics_system.cpp
++// vig8-ps4 (v00.08): Vigilante 8 loads two shaders a draw (IM_LOAD, ~9,700 a frame in busy views), and each load
++// hashed the microcode (XXH3) and looked the hash up: ~4 % of the command processor's time.
++REXCVAR_DEFINE_BOOL(gpu_shader_load_cache, true, "GPU",
++                    "IM_LOAD: a shader loaded again from the same address with the same microcode (compared) "
++                    "is taken from a small cache instead of being hashed again")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(gpu_wait_reg_mem_poll_us, 100, "GPU",
++                     "A WAIT_REG_MEM packet that has not matched looks again after this many microseconds (0: after "
++                     "the packet's own interval, wait/0x100 ms, as Xenia)")
++    .range(0, 100000);
++// vig8-ps4: the read pointer past an INDIRECT_BUFFER packet as soon as the packet is read, before the buffer runs - the
++// hardware's fetcher moves on in the ring before the buffer is executed - so the game can fill the ring meanwhile.
++REXCVAR_DEFINE_BOOL(gpu_rptr_at_ib_fetch, true, "GPU",
++                    "Publish the ring's read pointer past an indirect buffer packet when it is read, before the buffer "
++                    "runs (false: after it ran)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
+                       "Controls CPU readback of render-to-texture resolve results.\n"
+@@ -179,7 +199,7 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
+   }
+ }
+ 
+-void CommandProcessor::ClearCaches() {}
++void CommandProcessor::ClearCaches() { ResetShaderLoadCache(); }
+ 
+ void CommandProcessor::InvalidateGpuMemory() {}
+ 
+@@ -226,7 +246,45 @@ REXCVAR_DEFINE_INT32(gpu_commands_core, -2, "GPU",
+ extern "C" uint64_t ps4_new_thread_cores;  // ps4-kit: the process's cores (0x7F with the 7th core)
+ #endif
+ 
++// vig8-ps4 (v00.09): a test - the command processor moves between these cores, one stats period (gpu_stats_log_s)
++// each, and the [cp2] line names the core of the period it closes: is the command processor faster on the other core
++// module (core 6, the default) or on the game thread's (cores 0-3 share one 2 MB L2; the two modules' caches reach
++// each other only through the memory controller)?
++REXCVAR_DEFINE_STRING(gpu_commands_core_cycle, "", "GPU",
++                      "Test: cores the GPU command processor moves between, one stats period each (e.g. \"6,2\"); "
++                      "empty = off (gpu_commands_core)");
++
++namespace {
++std::atomic<int> cp_core_cycle_index{0};
++
++// The cores in gpu_commands_core_cycle (0-6), at most 8.
++int ParseCoreCycle(int* cores) {
++  const std::string& text = REXCVAR_GET(gpu_commands_core_cycle);
++  int count = 0;
++  for (size_t i = 0; i < text.size() && count < 8; ++i) {
++    if (text[i] >= '0' && text[i] <= '6') {
++      cores[count++] = text[i] - '0';
++    }
++  }
++  return count;
++}
++}  // namespace
++
++bool CommandProcessorCoreCycling() {
++  int cores[8];
++  return ParseCoreCycle(cores) > 1;
++}
++
++void AdvanceCommandProcessorCoreCycle() { cp_core_cycle_index.fetch_add(1, std::memory_order_relaxed); }
++
+ int CommandProcessorCore() {
++  {
++    int cores[8];
++    const int count = ParseCoreCycle(cores);
++    if (count > 0) {
++      return cores[uint32_t(cp_core_cycle_index.load(std::memory_order_relaxed)) % uint32_t(count)];
++    }
++  }
+   const int core = REXCVAR_GET(gpu_commands_core);
+   if (core != -2) {
+     return core;
+@@ -438,6 +496,16 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+     return;
+   }
+ 
++  // vig8-ps4 (v00.09): register value changes between draws outside the shader constants and the draw's own registers
++  // (index range and offset, initiators, scratch, coherency) - the same-state draw count.
++  if (regs.values[index] != value &&
++      (index < XE_GPU_REG_SHADER_CONSTANT_000_X || index > XE_GPU_REG_SHADER_CONSTANT_LOOP_31) &&
++      !(index >= XE_GPU_REG_VGT_EVENT_INITIATOR && index <= XE_GPU_REG_VGT_IMMED_DATA) &&
++      !(index >= XE_GPU_REG_VGT_MAX_VTX_INDX && index <= XE_GPU_REG_VGT_INDX_OFFSET) &&
++      !(index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) &&
++      !(index >= XE_GPU_REG_COHER_SIZE_HOST && index <= XE_GPU_REG_COHER_STATUS_HOST)) {
++    ++state_changes_since_draw_;
++  }
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+   // (No GetRegisterInfo lookup at every write for a debug line: 1.8 % of mp3-ps4 v00.06's command processor.)
+@@ -705,6 +773,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+   reader.set_read_offset(read_index * sizeof(uint32_t));
+   reader.set_write_offset(write_index * sizeof(uint32_t));
++  primary_reader_ = &reader;  // vig8-ps4: ExecutePacketType3_INDIRECT_BUFFER
+ 
+   /*
+    * Publish the read pointer while executing, not only at the end
+@@ -762,6 +831,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+     }
+   } while (reader.read_count());
+ 
++  primary_reader_ = nullptr;
+   OnPrimaryBufferEnd();
+ 
+   return write_index;
+@@ -770,6 +840,12 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
+ 
++  // vig8-ps4 (from sp00nznet/rexglue-sdk 48c98c2): an empty indirect buffer is a no-op on the console; a RingBuffer of
++  // capacity 0 would divide by zero in set_write_offset.
++  if (count == 0) {
++    return;
++  }
++
+   // Execute commands!
+   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+   reader.set_write_offset(count * sizeof(uint32_t));
+@@ -784,6 +860,10 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+ }
+ 
+ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
++  // vig8-ps4: an empty packet stream, as an empty indirect buffer above.
++  if (count == 0) {
++    return;
++  }
+   // Execute commands!
+   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+   reader.set_write_offset(count * sizeof(uint32_t));
+@@ -887,6 +967,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+   if (packet & 1) {
+     bool any_pass = (bin_select_ & bin_mask_) != 0;
+     if (!any_pass || opcode == PM4_XE_SWAP) {
++      cp_perf::Add(cp_perf::predicated_skipped, 1);  // vig8-ps4 (v00.10)
+       reader->AdvanceRead(count * sizeof(uint32_t));
+       return true;
+     }
+@@ -932,9 +1013,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+       result = ExecutePacketType3_EVENT_WRITE_SHD(reader, packet, count);
+       break;
+     case PM4_EVENT_WRITE_EXT:
++      cp_perf::Add(cp_perf::extent_events, 1);  // vig8-ps4 (v00.10)
+       result = ExecutePacketType3_EVENT_WRITE_EXT(reader, packet, count);
+       break;
+     case PM4_EVENT_WRITE_ZPD:
++      cp_perf::Add(cp_perf::zpd_events, 1);  // vig8-ps4 (v00.09)
+       result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+       break;
+     case PM4_DRAW_INDX:
+@@ -965,6 +1048,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+       result = ExecutePacketType3_INVALIDATE_STATE(reader, packet, count);
+       break;
+     case PM4_VIZ_QUERY:
++      cp_perf::Add(cp_perf::viz_queries, 1);  // vig8-ps4 (v00.09)
+       result = ExecutePacketType3_VIZ_QUERY(reader, packet, count);
+       break;
+ 
+@@ -1111,6 +1195,12 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
+   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
+   assert_zero(list_length & ~0xFFFFF);
+   list_length &= 0xFFFFF;
++  // vig8-ps4 (gpu_rptr_at_ib_fetch): from the primary ring, the read pointer goes past this packet now, before the buffer
++  // runs, as the hardware's fetcher does (its body is read: the ring's words can be written again).
++  if (reader == primary_reader_ && read_ptr_writeback_ptr_ && REXCVAR_GET(gpu_rptr_at_ib_fetch)) {
++    memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
++                                     uint32_t(reader->read_offset() / sizeof(uint32_t)));
++  }
+   ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
+   return true;
+ }
+@@ -1128,6 +1218,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+   uint32_t wait = reader->ReadAndSwap<uint32_t>();
+ 
+   bool is_memory = (wait_info & 0x10) != 0;
++  cp_perf::Add(cp_perf::wait_reg_mem, 1);  // vig8-ps4
++  const uint64_t wait_start_ticks = cp_perf::Ticks();
+ 
+   // mp3-ps4 (v00.05): v00.04's GPU side stopped in gameplay with the game's other threads alive. A wait that has not
+   // matched for 3 s says what it waits for, once (gpu_stats_log: the diagnostics' switch).
+@@ -1187,12 +1279,21 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+     if (!matched) {
+       waited = true;
++      // vig8-ps4 (vblank_at_gpu_wait): what the GPU waits for may be the guest vblank's work; it comes now (once a
++      // refresh still). Asked again at each look: a vblank that came before the guest's flag was ready leaves the next
++      // refresh's vblank to be brought forward at its start.
++      if (graphics_system_ && REXCVAR_GET(vblank_at_gpu_wait)) {
++        graphics_system_->RequestEarlyVblank();
++      }
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
++        } else if (const int32_t poll_us = REXCVAR_GET(gpu_wait_reg_mem_poll_us); poll_us > 0) {
++          // vig8-ps4: look again soon (the packet's interval at most).
++          rex::thread::Sleep(std::chrono::microseconds(std::min<uint64_t>(uint64_t(poll_us), (wait / 0x100) * 1000ull)));
+         } else {
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+         }
+@@ -1209,8 +1310,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   } while (!matched);
+   if (waited) {
++    if (graphics_system_) {
++      graphics_system_->CancelEarlyVblank();  // vig8-ps4: matched; no vblank owed to this wait any more
++    }
+     // What the guest wrote while the packet waited may be read by the commands after it.
+     OnGuestWaitDone();
++    // vig8-ps4: the [wait] stats line.
++    cp_perf::Add(cp_perf::wait_reg_mem_waited, 1);
++    cp_perf::Add(cp_perf::wait_reg_mem_ticks, cp_perf::Ticks() - wait_start_ticks);
++    cp_perf::wait_reg_mem_last_key.store((uint64_t(is_memory) << 63) | (uint64_t(wait_info & 0x7) << 56) |
++                                             poll_reg_addr,
++                                         std::memory_order_relaxed);
++    cp_perf::wait_reg_mem_last_ref.store((uint64_t(mask) << 32) | ref, std::memory_order_relaxed);
+   }
+   if (wait_reported) {
+     REXGPU_WARN("[cp] WAIT_REG_MEM on {:08X} matched after {:.1f} s (value {:08X})", poll_reg_addr,
+@@ -1456,6 +1567,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+   // when true, render conditionally based on query result
+   // uint32_t viz_use = viz_query_condition & 0x100;
+ 
++  if (viz_query_condition) {
++    cp_perf::Add(cp_perf::conditional_draws, 1);  // vig8-ps4 (v00.09)
++  }
+   assert_not_zero(count_remaining);
+   if (!count_remaining) {
+     REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
+@@ -1689,8 +1803,29 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
+   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
+   assert_true(start == 0);
+ 
+-  auto shader =
+-      LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
++  uint32_t* const guest_dwords = memory_->TranslatePhysical<uint32_t*>(addr);
++  Shader* shader = nullptr;
++  ShaderLoadCacheEntry* cache_entry = nullptr;  // vig8-ps4 (v00.08, gpu_shader_load_cache)
++  if (size_dwords && REXCVAR_GET(gpu_shader_load_cache)) {
++    cache_entry = &shader_load_cache_[((addr >> 2) ^ (addr >> 13) ^ (size_dwords * 0x9E3779B1u)) &
++                                      (kShaderLoadCacheSize - 1)];
++    if (cache_entry->shader && cache_entry->address == addr && cache_entry->dword_count == size_dwords &&
++        cache_entry->type == uint32_t(shader_type) &&
++        !std::memcmp(cache_entry->guest_dwords.data(), guest_dwords, size_t(size_dwords) * sizeof(uint32_t))) {
++      shader = cache_entry->shader;
++      cp_perf::Add(cp_perf::shader_load_hits, 1);
++    }
++  }
++  if (!shader) {
++    shader = LoadShader(shader_type, addr, guest_dwords, size_dwords);
++    if (cache_entry && shader) {
++      cache_entry->address = addr;
++      cache_entry->dword_count = size_dwords;
++      cache_entry->type = uint32_t(shader_type);
++      cache_entry->shader = shader;
++      cache_entry->guest_dwords.assign(guest_dwords, guest_dwords + size_dwords);
++    }
++  }
+   switch (shader_type) {
+     case xenos::ShaderType::kVertex:
+       active_vertex_shader_ = shader;
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 1010566..9c62e64 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include <rex/cvar.h>
+ #include <rex/graphics/command_processor.h>
++#include <rex/graphics/cp_perf.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+ #include <rex/logging.h>
+@@ -36,6 +37,16 @@ REXCVAR_DEFINE_INT32(vblank_rate_scale, 1, "GPU",
+                      "30 fps -> 60")
+     .range(1, 4);
+ 
++// vig8-ps4: after each frame, Vigilante 8's GPU commands wait (WAIT_REG_MEM) for a flag its vblank interrupt
++// clears; the guest vblank came on a fixed 60 Hz clock, so the command processor - the port's bottleneck - sat out
++// half a refresh on average, every frame (8-10 ms of a 40-65 ms frame). A wait that has not matched now fires the
++// coming vblank at once, and that vblank's turn on the clock is skipped: one vblank each 1/60 s as before, so a game
++// that counts them keeps its time; only their phase follows the GPU.
++REXCVAR_DEFINE_BOOL(vblank_at_gpu_wait, true, "GPU",
++                    "A command processor wait that has not matched brings the coming guest vblank forward (still one "
++                    "a refresh). Live")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -169,15 +180,33 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+                     int(vblank_scale), refresh_rate_hz);
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        // vig8-ps4 (vblank_at_gpu_wait): the coming vblank has fired already, brought forward to a GPU wait; its turn
++        // on the clock is skipped.
++        bool next_vblank_fired = false;
+         while (vsync_worker_running_) {
++          const bool vsync_on = REXCVAR_GET(vsync);
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+-          uint64_t interval_ticks =
+-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
++          uint64_t interval_ticks = vsync_on ? vsync_interval_ticks : no_vsync_interval_ticks;
+           while (current_time - last_frame_time >= interval_ticks) {
+-            MarkVblank();
++            if (!next_vblank_fired) {
++              MarkVblank();
++            }
++            next_vblank_fired = false;
+             last_frame_time += interval_ticks;
+           }
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
++          const bool can_bring_forward = vsync_on && !next_vblank_fired && REXCVAR_GET(vblank_at_gpu_wait);
++          if (can_bring_forward && early_vblank_requested_.exchange(false, std::memory_order_acq_rel)) {
++            MarkVblank();
++            next_vblank_fired = true;
++            cp_perf::Add(cp_perf::vblanks_early, 1);
++            continue;
++          }
++          // Until the next vblank is due (1 ms steps, as before), or a GPU wait asks for it.
++          std::unique_lock<std::mutex> lock(vblank_wake_mutex_);
++          vblank_wake_cv_.wait_for(lock, std::chrono::milliseconds(1), [&] {
++            return !vsync_worker_running_ ||
++                   (can_bring_forward && early_vblank_requested_.load(std::memory_order_acquire));
++          });
+         }
+         return 0;
+       }));
+@@ -327,10 +356,20 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+                                          rex::countof(args));
+ }
+ 
++void GraphicsSystem::RequestEarlyVblank() {
++  if (early_vblank_requested_.exchange(true, std::memory_order_acq_rel)) {
++    return;  // asked already
++  }
++  // Under the worker's lock: its wait checks the request and sleeps in one step, so the wake-up is not lost.
++  std::lock_guard<std::mutex> lock(vblank_wake_mutex_);
++  vblank_wake_cv_.notify_one();
++}
++
+ void GraphicsSystem::MarkVblank() {
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+ 
++  cp_perf::Add(cp_perf::vblanks, 1);  // vig8-ps4: the [wait] line
+   // Increment vblank counter (so the game sees us making progress).
+   if (command_processor_) {
+     command_processor_->increment_counter();
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index c511239..dee3e80 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -342,6 +342,7 @@ void RenderTargetCache::InitializeCommon() {
+ }
+ 
+ void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
++  ++update_epoch_;  // vig8-ps4 (v00.08)
+   ownership_ranges_.clear();
+   if (!shutting_down) {
+     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+@@ -362,6 +363,7 @@ void RenderTargetCache::ShutdownCommon() {
+ }
+ 
+ void RenderTargetCache::ClearCache() {
++  ++update_epoch_;  // vig8-ps4 (v00.08)
+   // Keep only render targets currently owning any EDRAM data.
+   if (!render_targets_.empty()) {
+     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
+@@ -401,7 +403,7 @@ void RenderTargetCache::BeginFrame() {
+ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
+-  cp_perf::ScopeTicks cp_perf_time(cp_perf::rt_ticks);
++  cp_perf::ScopePartTicks cp_perf_time(cp_perf::rt_ticks);  // vig8-ps4 (v00.09): sampled
+   const RegisterFile& regs = register_file();
+   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+ 
+@@ -1243,6 +1245,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+                                         uint32_t length_tiles,
+                                         std::vector<Transfer>* transfers_append_out,
+                                         const Transfer::Rectangle* resolve_clear_cutout) {
++  ++update_epoch_;  // vig8-ps4 (v00.08)
+   // xenos::kEdramTileCount with length 0 is fine if both the start and the end
+   // are clamped to xenos::kEdramTileCount.
+   assert_true(start_tiles_base_relative <= (xenos::kEdramTileCount - uint32_t(length_tiles != 0)));
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 5460455..42ad818 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -211,6 +211,8 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
+       shared_memory_(shared_memory),
+       draw_resolution_scale_x_(draw_resolution_scale_x),
+       draw_resolution_scale_y_(draw_resolution_scale_y) {
++  // vig8-ps4 (v00.09): a power-of-two bucket count (stays one as libc++ grows it): a mask, not a modulo, a lookup.
++  textures_.rehash(4096);
+   assert_true(draw_resolution_scale_x >= 1);
+   assert_true(draw_resolution_scale_x <= kMaxDrawResolutionScaleAlongAxis);
+   assert_true(draw_resolution_scale_y >= 1);
+@@ -453,10 +455,12 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
+ }
+ 
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+-  cp_perf::ScopeTicks cp_perf_time(cp_perf::tex_ticks);
++  cp_perf::ScopePartTicks cp_perf_time(cp_perf::tex_ticks);  // vig8-ps4 (v00.09): sampled
+   const auto& regs = register_file();
+ 
+-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
++  // vig8-ps4 (v00.09): read first - the exchange is a locked instruction, and the flag is almost never set.
++  if (texture_became_outdated_.load(std::memory_order_relaxed) &&
++      texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+     // A texture has become outdated - make sure whether textures are outdated
+     // is rechecked in this draw and in subsequent ones to reload the new data
+     // if needed.
+diff --git a/src/graphics/primitive_processor.cpp b/src/graphics/primitive_processor.cpp
+index 2170394..adbec75 100644
+--- a/src/graphics/primitive_processor.cpp
++++ b/src/graphics/primitive_processor.cpp
+@@ -278,7 +278,7 @@ void PrimitiveProcessor::ClearPerFrameCache() {
+ }
+ 
+ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+-  cp_perf::ScopeTicks cp_perf_time(cp_perf::prim_ticks);
++  cp_perf::ScopePartTicks cp_perf_time(cp_perf::prim_ticks);  // vig8-ps4 (v00.09): sampled
+   SCOPE_profile_cpu_f("gpu");
+ 
+   const RegisterFile& regs = register_file_;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 840623b..faeb432 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -46,6 +46,9 @@
+ #include <rex/graphics/cp_perf.h>
+ #include <rex/thread.h>
+ #include <xxhash.h>
++#if defined(__SSSE3__)
++#include <immintrin.h>  // vig8-ps4 (v00.08): constant writes
++#endif
+ #include <rex/graphics/vulkan/command_processor.h>
+ #include <rex/graphics/vulkan/pipeline_cache.h>
+ #include <rex/graphics/vulkan/render_target_cache.h>
+@@ -60,6 +63,7 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ REXCVAR_DECLARE(bool, gpu_hot_memory);  // shared_memory.cpp (v00.24)
++REXCVAR_DECLARE(bool, vblank_at_gpu_wait);  // graphics_system.cpp (vig8-ps4), for the [wait] line
+ REXCVAR_DECLARE(bool, gpu_skip_unchanged_constants);  // below (v00.25), used by the stats first
+ 
+ namespace rex::system {
+@@ -161,6 +165,17 @@ void CensusDraw(const rex::graphics::RegisterFile& regs, const rex::graphics::Sh
+   CensusTextures(regs, ps, "ps");
+ }
+ 
++// vig8-ps4 (v00.09): the draw's shaders, primitive type and index count (rounded down to a power of two): which
++// objects make up a frame's thousands of draws.
++void CensusShaders(const rex::graphics::Shader* vs, const rex::graphics::Shader* ps, uint32_t prim_type,
++                   uint32_t index_count) {
++  uint32_t bucket = 1;
++  while (bucket * 2 <= index_count && bucket < (1u << 30)) bucket *= 2;
++  CensusAdd(fmt::format("shaders vs {:016X} ps {:016X} prim {} indices {}-{}", vs ? vs->ucode_data_hash() : 0,
++                        ps ? ps->ucode_data_hash() : 0, prim_type, index_count ? bucket : 0,
++                        index_count ? bucket * 2 - 1 : 0));
++}
++
+ void CensusCopy(const rex::graphics::RegisterFile& regs) {
+   using namespace rex::graphics;
+   {
+@@ -507,18 +522,23 @@ void CpStatsOnSwap() {
+     REXGPU_INFO("{}", timing);
+     text += '\n' + timing;
+     // v00.20: a draw's parts, and the submission thread's waits (by caller).
+-    const uint64_t prim = take(cpp::prim_ticks), tex = take(cpp::tex_ticks), rt = take(cpp::rt_ticks);
+-    const uint64_t pipe = take(cpp::pipe_ticks), dyn = take(cpp::dyn_ticks), sysc = take(cpp::sysc_ticks);
+-    const uint64_t bind = take(cpp::bind_ticks), enter = take(cpp::enter_ticks);
++    // vig8-ps4 (v00.09): the parts are timed in one draw of kPartSampleEvery (cp_perf.h): scaled up here.
++    constexpr uint64_t part_scale = cpp::kPartSampleEvery;
++    const uint64_t prim = part_scale * take(cpp::prim_ticks), tex = part_scale * take(cpp::tex_ticks), rt = part_scale * take(cpp::rt_ticks);
++    const uint64_t pipe = part_scale * take(cpp::pipe_ticks), dyn = part_scale * take(cpp::dyn_ticks), sysc = part_scale * take(cpp::sysc_ticks);
++    const uint64_t bind = part_scale * take(cpp::bind_ticks), enter = part_scale * take(cpp::enter_ticks);
+     const uint64_t shader = take(cpp::shader_ticks), loads = take(cpp::shader_loads);
+     const uint64_t await = take(cpp::await_ticks), swap_await = take(cpp::swap_await_ticks);
+     const std::string parts = fmt::format(
+         "[cpt2] in draws: primitives {:.1f} %, textures {:.1f} %, render targets {:.1f} %, pipeline {:.1f} %, "
+         "dynamic state {:.1f} %, system constants {:.1f} %, bindings {:.1f} %, render pass {:.1f} %; shader loads "
+-        "{:.1f} % ({:.0f} a frame); waits for the submission thread {:.1f} % (at the swap {:.1f} %)",
++        "{:.1f} % ({:.0f} a frame, {:.0f} more from the address cache); waits for the submission thread {:.1f} % (at "
++        "the swap {:.1f} %); render target updates skipped {:.0f} a frame; texture sets matched without a hash {:.0f} "
++        "a frame",
+         double(prim) / wall, double(tex) / wall, double(rt) / wall, double(pipe) / wall, double(dyn) / wall,
+         double(sysc) / wall, double(bind) / wall, double(enter) / wall, double(shader) / wall, double(loads) / f,
+-        double(await) / wall, double(swap_await) / wall);
++        double(take(cpp::shader_load_hits)) / f, double(await) / wall, double(swap_await) / wall,
++        double(take(cpp::rt_updates_skipped)) / f, double(take(cpp::texture_sets_last_hits)) / f);
+     REXGPU_INFO("{}", parts);
+     text += '\n' + parts;
+     // v00.21: the draws' descriptor sets.
+@@ -531,9 +551,9 @@ void CpStatsOnSwap() {
+     REXGPU_INFO("{}", sets);
+     text += '\n' + sets;
+     // v00.22: the rest of the draws.
+-    const uint64_t analyze = take(cpp::analyze_ticks), shaders = take(cpp::shaders_ticks);
+-    const uint64_t samplers = take(cpp::samplers_ticks), viewport = take(cpp::viewport_ticks);
+-    const uint64_t vertex = take(cpp::vertex_ticks), record = take(cpp::record_ticks);
++    const uint64_t analyze = part_scale * take(cpp::analyze_ticks), shaders = part_scale * take(cpp::shaders_ticks);
++    const uint64_t samplers = part_scale * take(cpp::samplers_ticks), viewport = part_scale * take(cpp::viewport_ticks);
++    const uint64_t vertex = part_scale * take(cpp::vertex_ticks), record = part_scale * take(cpp::record_ticks);
+     const std::string rest = fmt::format(
+         "[cpt3] in draws: shader analysis {:.1f} %, shader variants {:.1f} %, samplers {:.1f} %, viewport {:.1f} %, "
+         "vertex buffers {:.1f} %, recording {:.1f} %",
+@@ -541,6 +561,27 @@ void CpStatsOnSwap() {
+         double(vertex) / wall, double(record) / wall);
+     REXGPU_INFO("{}", rest);
+     text += '\n' + rest;
++    // vig8-ps4 (v00.09): occlusion and visibility queries, conditional draws, same-state draws, the sampler memo, and
++    // the core this period ran on (gpu_commands_core_cycle moves the command processor after this line).
++    {
++      const uint64_t lookups = take(cpp::sampler_lookups), memo_hits = take(cpp::sampler_memo_hits);
++      const std::string cp2 = fmt::format(
++          "[cp2] a frame: {:.1f} occlusion query events, {:.1f} visibility queries (both reported visible), {:.1f} "
++          "conditional draws (all drawn); {:.0f} draws found the state of the draw before them (only shader "
++          "constants changed, same shaders), {:.0f} more with fetch constants changed too; sampler parameters "
++          "{:.0f} a frame, {:.0f} % from the memo; predicated tiling: {:.1f} screen extent events, {:.1f} "
++          "predicated packets left out; this period on core {}{}",
++          double(take(cpp::zpd_events)) / f, double(take(cpp::viz_queries)) / f,
++          double(take(cpp::conditional_draws)) / f, double(take(cpp::draws_same_state)) / f,
++          double(take(cpp::draws_same_but_fetch)) / f, double(lookups) / f,
++          lookups ? 100.0 * double(memo_hits) / double(lookups) : 0.0, double(take(cpp::extent_events)) / f,
++          double(take(cpp::predicated_skipped)) / f, rex::graphics::CommandProcessorCore(),
++          rex::graphics::CommandProcessorCoreCycling() ? " (gpu_commands_core_cycle: next period on the next core)"
++                                                       : "");
++      REXGPU_INFO("{}", cp2);
++      text += '\n' + cp2;
++      rex::graphics::AdvanceCommandProcessorCoreCycle();
++    }
+     // v00.23: the write watches' arming, all threads.
+     uint64_t arm_calls, arm_skipped, arm_protects, arm_protect_ticks, arm_lock_ticks;
+     rex::memory::ArmStats(&arm_calls, &arm_skipped, &arm_protects, &arm_protect_ticks, &arm_lock_ticks);
+@@ -574,6 +615,38 @@ void CpStatsOnSwap() {
+         REXCVAR_GET(gpu_skip_unchanged_constants) ? "yes" : "no");
+     REXGPU_INFO("{}", regs_text);
+     text += '\n' + regs_text;
++    // vig8-ps4: the guest's WAIT_REG_MEM packets (gpu_wait_reg_mem_poll_us), and what the last waiting one waited for.
++    const uint64_t wrm = take(cpp::wait_reg_mem), wrm_waited = take(cpp::wait_reg_mem_waited);
++    const uint64_t wrm_ticks = take(cpp::wait_reg_mem_ticks);
++    const uint64_t wrm_key = cpp::wait_reg_mem_last_key.load(std::memory_order_relaxed);
++    const uint64_t wrm_ref = cpp::wait_reg_mem_last_ref.load(std::memory_order_relaxed);
++    const double wrm_ticks_per_ms = std::max(wall * 100.0 / (seconds * 1e3), 1.0);
++    const uint64_t vblanks = take(cpp::vblanks), vblanks_early = take(cpp::vblanks_early);
++    // The command processor's CPU time since the last line (this runs on its thread), as a share of the wall time.
++    double cpu_share = -1.0;
++#if REX_PLATFORM_PS4
++    {
++      static uint64_t last_cpu_ns = 0;
++      timespec cpu_now{};
++      if (clock_gettime(static_cast<clockid_t>(14), &cpu_now) == 0) {  // FreeBSD's CLOCK_THREAD_CPUTIME_ID
++        const uint64_t cpu_ns = uint64_t(cpu_now.tv_sec) * 1000000000ull + uint64_t(cpu_now.tv_nsec);
++        if (last_cpu_ns) {
++          cpu_share = 100.0 * double(cpu_ns - last_cpu_ns) / (seconds * 1e9);
++        }
++        last_cpu_ns = cpu_ns;
++      }
++    }
++#endif
++    const std::string wait_text = fmt::format(
++        "[wait] a frame: {:.1f} WAIT_REG_MEM, {:.1f} of them waited, {:.1f} % of the time ({:.2f} ms a frame); the "
++        "last one that waited: {} {:08X}, function {}, reference {:08X}, mask {:08X}; vblanks {:.1f}/s, {:.1f}/s of "
++        "them brought forward to a wait ({}); the command processor on the CPU {:.1f} % of the time",
++        double(wrm) / f, double(wrm_waited) / f, double(wrm_ticks) / wall, double(wrm_ticks) / wrm_ticks_per_ms / f,
++        (wrm_key >> 63) ? "memory" : "register", uint32_t(wrm_key), uint32_t(wrm_key >> 56) & 0x7,
++        uint32_t(wrm_ref), uint32_t(wrm_ref >> 32), double(vblanks) / seconds, double(vblanks_early) / seconds,
++        REXCVAR_GET(vblank_at_gpu_wait) ? "on" : "off", cpu_share);
++    REXGPU_INFO("{}", wait_text);
++    text += '\n' + wait_text;
+   }
+ #if REX_PLATFORM_PS4
+   // The faults behind the frame (rex/exception_handler.h): stores single-stepped next to a write-watched page, 16 KiB
+@@ -633,6 +706,13 @@ REX_GPU_DIAG void rex_gpu_resdump_start(const char* dir) {
+ }
+ REX_GPU_DIAG int rex_gpu_resdump_done(void) { return g_resdump_state.load() == 0; }
+ 
++// vig8-ps4 (v00.10): the swap post effect (0 none, 1 FXAA, 2 extreme FXAA) from the app's settings, live - the next
++// swap takes it (the swap_post_effect cvar is read once, as the graphics system starts). -1: no request.
++std::atomic<int32_t> g_swap_post_effect_request{-1};
++REX_GPU_DIAG void rex_gpu_set_swap_post_effect(int32_t effect) {
++  g_swap_post_effect_request.store(effect, std::memory_order_relaxed);
++}
++
+ // The census (see above): start one for `frames` frames; the text once it is done ("" while it runs).
+ REX_GPU_DIAG void rex_gpu_census_start(uint32_t frames) {
+   {
+@@ -1473,6 +1553,10 @@ bool VulkanCommandProcessor::SetupContext() {
+   // Guest draw constants.
+   // mp3-ps4 (v00.26): with dynamic offsets (vulkan_dynamic_constants).
+   dynamic_constants_ = REXCVAR_GET(vulkan_dynamic_constants);
++  // vig8-ps4 (v00.09): power-of-two bucket counts stay powers of two as libc++ grows them: a mask instead of a 64-bit
++  // modulo (~40-70 cycles on Jaguar) at each lookup. Both keys hash well in their low bits (FNV-style, XXH3).
++  constants_dynamic_sets_.rehash(4096);
++  texture_set_cache_.rehash(4096);
+   VkDescriptorSetLayoutBinding
+       descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferCount] = {};
+   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+@@ -2810,6 +2894,7 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+              index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+     current_constant_buffers_up_to_date_ &=
+         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
++    fetch_changed_since_draw_ = true;  // vig8-ps4 (v00.09)
+     if (texture_cache_) {
+       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
+                                                   6);
+@@ -2863,7 +2948,25 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+     }
+     first = UINT32_MAX;
+     last = 0;
+-    for (uint32_t i = 0; i < num_registers; ++i) {
++    uint32_t i = 0;
++#if defined(__SSSE3__)
++    // vig8-ps4 (v00.08): ~540,000 constant dwords a frame in busy views; four compared and stored at a time.
++    const __m128i swap_mask = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
++    for (; i + 4 <= num_registers; i += 4) {
++      const __m128i guest =
++          _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(base + i)), swap_mask);
++      const __m128i current = _mm_loadu_si128(reinterpret_cast<const __m128i*>(values + i));
++      const uint32_t same = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi32(guest, current)));
++      if (same == 0xFFFFu) {
++        continue;
++      }
++      _mm_storeu_si128(reinterpret_cast<__m128i*>(values + i), guest);
++      const uint32_t differ = ~same & 0xFFFFu;  // a byte mask: four bits a dword
++      first = std::min(first, i + (uint32_t(__builtin_ctz(differ)) >> 2));
++      last = i + ((31u - uint32_t(__builtin_clz(differ))) >> 2);
++    }
++#endif
++    for (; i < num_registers; ++i) {
+       const uint32_t value = rex::byte_swap(base[i]);
+       if (values[i] != value) {
+         values[i] = value;
+@@ -2930,6 +3033,7 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+       return;
+     }
+     cp_perf::Add(cp_perf::fetch_changed, changed_last - changed_first + 1);
++    fetch_changed_since_draw_ = true;  // vig8-ps4 (v00.09)
+     current_constant_buffers_up_to_date_ &=
+         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+     uint32_t first_fetch_dword = start_index + changed_first - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+@@ -2981,6 +3085,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   TraceOnSwap();
+   DebugSkipOnSwap();
+   FrameDebugOnSwap();
++  // vig8-ps4 (v00.10): the app's anti-aliasing setting (rex_gpu_set_swap_post_effect), live.
++  {
++    const int32_t requested = g_swap_post_effect_request.load(std::memory_order_relaxed);
++    if (requested >= int32_t(SwapPostEffect::kNone) && requested <= int32_t(SwapPostEffect::kFxaaExtreme) &&
++        SwapPostEffect(requested) != swap_post_effect_actual_) {
++      swap_post_effect_desired_ = swap_post_effect_actual_ = SwapPostEffect(requested);
++      REXGPU_INFO("[swap] post effect: {}", requested == 0 ? "none" : requested == 1 ? "FXAA" : "extreme FXAA");
++    }
++  }
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -3799,7 +3912,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+ 
+ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
+-  cp_perf::ScopeTicks cp_perf_time(cp_perf::enter_ticks);
++  cp_perf::ScopePartTicks cp_perf_time(cp_perf::enter_ticks);  // vig8-ps4 (v00.09): sampled
+   SubmitBarriers(false);
+   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+   bool use_dynamic_rendering =
+@@ -4313,6 +4426,7 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
++  cp_perf::BeginDraw();  // vig8-ps4 (v00.09): whether this draw times its parts
+   cp_perf::ScopeTicks draw_time(cp_perf::draw_ticks);
+   // mp3-ps4 (v00.18): a long submission is cut here, before this draw opens a new one (see vulkan_submit_every_draws).
+   if (async_submit_enabled_ && submission_open_) {
+@@ -4327,6 +4441,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
+   ++g_cp_stats.draws;
++  {
++    // vig8-ps4 (v00.09): a draw that finds the state of the draw before it (only shader constants changed, same
++    // shaders) - what a shortcut for such draws could save ([cp2]).
++    const Shader* const vs_now = active_vertex_shader();
++    const Shader* const ps_now = active_pixel_shader();
++    if (!state_changes_since_draw_ && vs_now == last_draw_shaders_[0] && ps_now == last_draw_shaders_[1]) {
++      cp_perf::Add(fetch_changed_since_draw_ ? cp_perf::draws_same_but_fetch : cp_perf::draws_same_state, 1);
++    }
++    last_draw_shaders_[0] = vs_now;
++    last_draw_shaders_[1] = ps_now;
++    state_changes_since_draw_ = 0;
++    fetch_changed_since_draw_ = false;
++  }
+   const RegisterFile& regs = *register_file_;
+   (void)index_buffer_info;
+   auto draw_fail = [&](const char* stage) {
+@@ -4361,7 +4488,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     // Always need a vertex shader.
+     return draw_fail("missing_vertex_shader");
+   }
+-  const uint64_t analyze_start = cp_perf::Ticks();  // v00.22: to the interpolator mask (analyze_ticks)
++  const uint64_t analyze_start = cp_perf::PartTicks();  // v00.22: to the interpolator mask (analyze_ticks)
+   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
+   if (memexport_used_vertex) {
+@@ -4422,11 +4549,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                                              regs.Get<reg::SQ_CONTEXT_MISC>(),
+                                                              ps_param_gen_pos))
+                    : 0;
+-  cp_perf::Add(cp_perf::analyze_ticks, cp_perf::Ticks() - analyze_start);
++  cp_perf::AddPart(cp_perf::analyze_ticks, analyze_start);
+ 
+   PrimitiveProcessor::ProcessingResult primitive_processing_result;
+   if (g_census_frames_left.load(std::memory_order_relaxed)) {
+     CensusDraw(regs, vertex_shader, pixel_shader, !memexport_ranges_.empty());
++    CensusShaders(vertex_shader, pixel_shader, uint32_t(prim_type), index_count);  // vig8-ps4 (v00.09)
+   }
+   if (g_trace_frames_left.load(std::memory_order_relaxed)) TraceDraw(regs, vertex_shader, pixel_shader);
+   if (DebugSkipDraw(pixel_shader)) return true;
+@@ -4478,7 +4606,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+ 
+     // Shader modifications.
+-    const uint64_t shaders_start = cp_perf::Ticks();  // v00.22: to EnsureShadersTranslated (shaders_ticks)
++    const uint64_t shaders_start = cp_perf::PartTicks();  // v00.22: to EnsureShadersTranslated (shaders_ticks)
+     vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
+         *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
+         ps_param_gen_pos != UINT32_MAX);
+@@ -4498,7 +4626,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                                   pixel_shader_translation)) {
+       return draw_fail("shader_translation");
+     }
+-    cp_perf::Add(cp_perf::shaders_ticks, cp_perf::Ticks() - shaders_start);
++    cp_perf::AddPart(cp_perf::shaders_ticks, shaders_start);
+ 
+     // Obtain the samplers. Note that the bindings don't depend on the shader
+     // modification, so if on the second iteration of this loop it becomes
+@@ -4508,7 +4636,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
+     // submission.
+     uint32_t samplers_overflowed_count = 0;
+-    const uint64_t samplers_start = cp_perf::Ticks();  // v00.22 (samplers_ticks)
++    const uint64_t samplers_start = cp_perf::PartTicks();  // v00.22 (samplers_ticks)
+     for (uint32_t j = 0; j < 2; ++j) {
+       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
+           j ? current_samplers_pixel_ : current_samplers_vertex_;
+@@ -4552,7 +4680,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         }
+       }
+     }
+-    cp_perf::Add(cp_perf::samplers_ticks, cp_perf::Ticks() - samplers_start);
++    cp_perf::AddPart(cp_perf::samplers_ticks, samplers_start);
+     if (!samplers_overflowed_count) {
+       break;
+     }
+@@ -4568,6 +4696,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     // mp3-ps4 (v00.21): samplers may be destroyed to make room, and a new one may get a destroyed one's handle.
+     texture_set_cache_.clear();
+     texture_set_cache_infos_.clear();
++    ++texture_set_cache_generation_;  // vig8-ps4 (v00.08)
+     assert_true(sampler_overflow_await_submission <= GetCurrentSubmission());
+     CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
+   }
+@@ -4676,7 +4805,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // interlocks case completely - apply the viewport and the scissor offset
+   // directly to pixel address and to things like ps_param_gen.
+   {
+-    cp_perf::ScopeTicks viewport_time(cp_perf::viewport_ticks);  // v00.22
++    cp_perf::ScopePartTicks viewport_time(cp_perf::viewport_ticks);  // v00.22
+     draw_util::GetHostViewportInfo(
+         regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
+         device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
+@@ -4731,7 +4860,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+ 
+   // Ensure vertex buffers are resident.
+-  const uint64_t vertex_start = cp_perf::Ticks();  // v00.22: to the memexport ranges (vertex_ticks)
++  const uint64_t vertex_start = cp_perf::PartTicks();  // v00.22: to the memexport ranges (vertex_ticks)
+   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+@@ -4781,7 +4910,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
+-  cp_perf::Add(cp_perf::vertex_ticks, cp_perf::Ticks() - vertex_start);
++  cp_perf::AddPart(cp_perf::vertex_ticks, vertex_start);
+ 
+   // Synchronize the memory pages backing memory scatter export streams, and
+   // calculate the range that includes the streams for the buffer barrier.
+@@ -4850,7 +4979,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // TODO(Triang3l): Find some PM4 command that can be used for indication of
+   // when memexports should be awaited instead of inserting the barrier in Use
+   // every time if memory export was done in the previous draw?
+-  const uint64_t record_start = cp_perf::Ticks();  // v00.22: barrier + draw command, without the render pass
++  const uint64_t record_start = cp_perf::PartTicks();  // v00.22: barrier + draw command, without the render pass
+   if (memexport_extent_start < memexport_extent_end) {
+     shared_memory_->Use(
+         VulkanSharedMemory::Usage::kGuestDrawReadWrite,
+@@ -4865,14 +4994,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+   }
+ 
+-  const uint64_t record_mid = cp_perf::Ticks();
++  const uint64_t record_mid = cp_perf::PartTicks();
+   // After all commands that may dispatch, copy or insert barriers, submit
+   // the barriers (may end the render pass), and (re)enter the render pass
+   // before drawing.
+   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+       render_target_cache_->last_update_render_pass(),
+       render_target_cache_->last_update_framebuffer());
+-  const uint64_t record_resume = cp_perf::Ticks();
++  const uint64_t record_resume = cp_perf::PartTicks();
+ 
+   // Draw.
+   if (primitive_processing_result.index_buffer_type ==
+@@ -4912,7 +5041,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+                                               0, 0, 0);
+   }
+-  cp_perf::Add(cp_perf::record_ticks, (record_mid - record_start) + (cp_perf::Ticks() - record_resume));
++  if (record_start) {  // vig8-ps4 (v00.09): a timed draw
++    cp_perf::Add(cp_perf::record_ticks, (record_mid - record_start) + (cp_perf::Ticks() - record_resume));
++  }
+ 
+   // Invalidate textures in memexported memory and watch for changes.
+   if (!memexport_ranges_.empty()) {
+@@ -5973,6 +6104,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     // mp3-ps4 (v00.21): the previous frame's texture sets are recycled once it completes.
+     texture_set_cache_.clear();
+     texture_set_cache_infos_.clear();
++    ++texture_set_cache_generation_;  // vig8-ps4 (v00.08)
+     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] =
+         shared_memory_and_edram_descriptor_set_;
+     current_graphics_descriptor_set_values_up_to_date_ =
+@@ -6718,7 +6850,7 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
+ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
+                                                 bool primitive_polygonal,
+                                                 reg::RB_DEPTHCONTROL normalized_depth_control) {
+-  cp_perf::ScopeTicks cp_perf_time(cp_perf::dyn_ticks);
++  cp_perf::ScopePartTicks cp_perf_time(cp_perf::dyn_ticks);  // vig8-ps4 (v00.09): sampled
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -6929,7 +7061,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+     bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
+     const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
+     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask) {
+-  cp_perf::ScopeTicks cp_perf_time(cp_perf::sysc_ticks);
++  cp_perf::ScopePartTicks cp_perf_time(cp_perf::sysc_ticks);  // vig8-ps4 (v00.09): sampled
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -7426,7 +7558,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+ 
+ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+                                             const VulkanShader* pixel_shader) {
+-  cp_perf::ScopeTicks cp_perf_time(cp_perf::bind_ticks);
++  cp_perf::ScopePartTicks cp_perf_time(cp_perf::bind_ticks);  // vig8-ps4 (v00.09): sampled
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -7717,6 +7849,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+       texture_set_cache_destructions_ = texture_cache_->texture_destructions();
+       texture_set_cache_.clear();
+       texture_set_cache_infos_.clear();
++      ++texture_set_cache_generation_;  // vig8-ps4 (v00.08)
+     }
+     if (write_vertex_textures) {
+       VkDescriptorSet set = FindTextureSet(
+@@ -8045,6 +8178,16 @@ VkDescriptorSet VulkanCommandProcessor::FindTextureSet(bool is_vertex, uint32_t
+   layout_key.sampler_count = sampler_count;
+   layout_key.is_vertex = uint32_t(is_vertex);
+   const uint32_t info_count = texture_count + sampler_count;
++  // vig8-ps4 (v00.08): the set this stage used last, compared before anything is hashed.
++  LastTextureSet& last = last_texture_set_[is_vertex ? 1 : 0];
++  if (last.generation == texture_set_cache_generation_ && last.layout_key == layout_key.key &&
++      last.info_count == info_count &&
++      !std::memcmp(texture_set_cache_infos_.data() + last.info_offset, infos,
++                   sizeof(VkDescriptorImageInfo) * info_count)) {
++    hash_out = last.hash;
++    cp_perf::Add(cp_perf::texture_sets_last_hits, 1);
++    return last.set;
++  }
+   // The infos are value-initialized (zeroed, padding included) before their fields are set, so their bytes compare.
+   hash_out = XXH3_64bits_withSeed(infos, sizeof(VkDescriptorImageInfo) * info_count, layout_key.key);
+   auto it = texture_set_cache_.find(hash_out);
+@@ -8057,6 +8200,12 @@ VkDescriptorSet VulkanCommandProcessor::FindTextureSet(bool is_vertex, uint32_t
+                   sizeof(VkDescriptorImageInfo) * info_count)) {
+     return VK_NULL_HANDLE;
+   }
++  last.generation = texture_set_cache_generation_;
++  last.hash = hash_out;
++  last.set = entry.set;
++  last.layout_key = entry.layout_key;
++  last.info_count = entry.info_count;
++  last.info_offset = entry.info_offset;
+   return entry.set;
+ }
+ 
+@@ -8075,6 +8224,14 @@ void VulkanCommandProcessor::StoreTextureSet(bool is_vertex, uint32_t texture_co
+   texture_set_cache_infos_.insert(texture_set_cache_infos_.end(), infos, infos + entry.info_count);
+   // A hash collision with another combination replaces that one (it is written again if it comes back).
+   texture_set_cache_[hash] = entry;
++  // vig8-ps4 (v00.08): and it is the stage's last set now.
++  LastTextureSet& last = last_texture_set_[is_vertex ? 1 : 0];
++  last.generation = texture_set_cache_generation_;
++  last.hash = hash;
++  last.set = set;
++  last.layout_key = entry.layout_key;
++  last.info_count = entry.info_count;
++  last.info_offset = entry.info_offset;
+ }
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 88086ba..ecd8e54 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -92,7 +92,13 @@ constexpr bool IsPatchIndexedHostVertexShaderType(
+ 
+ std::string GetTessellationSystemConstantsBlockGlsl() {
+   std::string source;
+-  source += "layout(set = 0, binding = 0, std140) uniform XeSystemConstants {\n";
++  // vig8-ps4: the system constants are binding kConstantBufferSystem of the constants set
++  // (kDescriptorSetConstants = 1). Set 0 is the shared memory and EDRAM storage buffers: with "set = 0" these shaders
++  // read the start of guest memory as their constants - the factor range came out 0 and every tessellated patch was
++  // culled (vig8 v00.04: Hoover Dam's roads and bridge decks missing).
++  source += fmt::format("layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
++                        uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
++                        uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
+   source += fmt::format("  layout(offset = {}) uint xe_vertex_index_endian;\n",
+                         offsetof(SpirvShaderTranslator::SystemConstants, vertex_index_endian));
+   source += fmt::format("  layout(offset = {}) int xe_vertex_base_index;\n",
+@@ -129,7 +135,7 @@ uint xe_swap_16_in_32(uint value) {
+ void main() {
+   uint value = uint(gl_VertexIndex);
+   uint endian = xe_system_cbuffer.xe_vertex_index_endian;
+-  if (endian == 1u || endian == 2u || endian == 3u) {
++  if (endian == 1u || endian == 2u) {
+     value = xe_swap_8_in_16(value);
+   }
+   if (endian == 2u || endian == 3u) {
+@@ -163,13 +169,14 @@ uint xe_swap_16_in_32(uint value) {
+ void main() {
+   uint value = uint(gl_VertexIndex);
+   uint endian = xe_system_cbuffer.xe_vertex_index_endian;
+-  if (endian == 1u || endian == 2u || endian == 3u) {
++  if (endian == 1u || endian == 2u) {
+     value = xe_swap_8_in_16(value);
+   }
+   if (endian == 2u || endian == 3u) {
+     value = xe_swap_16_in_32(value);
+   }
+-  float tessellation_factor = float(value) + 1.0;
++  // The edge factor is a 32-bit float stored as the "index" (Xenia's adaptive VS: asfloat(...) + 1.0).
++  float tessellation_factor = uintBitsToFloat(value) + 1.0;
+   tessellation_factor = max(
+       tessellation_factor, xe_system_cbuffer.xe_tessellation_factor_range_min);
+   tessellation_factor = min(
+@@ -287,6 +294,7 @@ VulkanPipelineCache::~VulkanPipelineCache() {
+ }
+ 
+ bool VulkanPipelineCache::Initialize() {
++  pipelines_.rehash(2048);  // vig8-ps4 (v00.09): a power of two (XXH3 keys): a mask, not a modulo, a lookup
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+ 
+   bool edram_fragment_shader_interlock =
+@@ -1054,7 +1062,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+     VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
+     const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out) {
+-  cp_perf::ScopeTicks cp_perf_time(cp_perf::pipe_ticks);
++  cp_perf::ScopePartTicks cp_perf_time(cp_perf::pipe_ticks);  // vig8-ps4 (v00.09): sampled
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..ed8b4a8 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+@@ -36,11 +37,20 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
++#include <rex/graphics/cp_perf.h>  // vig8-ps4 (v00.08)
+ 
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++// vig8-ps4 (v00.08): 97 % of Vigilante 8's draws go to the same 4x MSAA scene targets, and each one ran the whole
++// render target update (ownership, transfers, framebuffer, barriers): ~9 % of the command processor's time.
++REXCVAR_DEFINE_BOOL(gpu_rt_update_skip, true, "GPU/Vulkan",
++                    "Skip the render target update of a draw whose render target, scissor and viewport registers and "
++                    "depth/color use are the same as the last full update's, with nothing else having touched the "
++                    "render targets since")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ // DEFINE_string(
+ //     render_target_path_vulkan, "",
+ //     "Render target emulation path to use on Vulkan.\n"
+@@ -1128,6 +1138,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                                       VulkanSharedMemory& shared_memory,
+                                       VulkanTextureCache& texture_cache,
+                                       uint32_t& written_address_out, uint32_t& written_length_out) {
++  ++update_epoch_;  // vig8-ps4 (v00.08): the render targets' use and contents change here
+   written_address_out = 0;
+   written_length_out = 0;
+ 
+@@ -1380,6 +1391,34 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+                                      reg::RB_DEPTHCONTROL normalized_depth_control,
+                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
++  // vig8-ps4 (v00.08, gpu_rt_update_skip): the same inputs as the last full update, nothing in between = its result.
++  // Clip-disabled draws are left out: their extent estimate may run the vertex shader on the vertices.
++  UpdateShortcutKey shortcut_key;
++  bool shortcut_possible = false;
++  {
++    static constexpr uint32_t kShortcutRegisters[17] = {
++        XE_GPU_REG_RB_SURFACE_INFO,         XE_GPU_REG_RB_DEPTH_INFO,           XE_GPU_REG_RB_COLOR_INFO,
++        XE_GPU_REG_RB_COLOR1_INFO,          XE_GPU_REG_RB_COLOR2_INFO,          XE_GPU_REG_RB_COLOR3_INFO,
++        XE_GPU_REG_PA_SC_WINDOW_OFFSET,     XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL, XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR,
++        XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL, XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR, XE_GPU_REG_PA_CL_CLIP_CNTL,
++        XE_GPU_REG_PA_CL_VTE_CNTL,          XE_GPU_REG_PA_SU_SC_MODE_CNTL,      XE_GPU_REG_PA_SU_VTX_CNTL,
++        XE_GPU_REG_PA_CL_VPORT_YOFFSET,     XE_GPU_REG_PA_CL_VPORT_YSCALE};
++    const RegisterFile& regs = register_file();
++    for (uint32_t i = 0; i < 17; ++i) {
++      shortcut_key.values[i] = regs.values[kShortcutRegisters[i]];
++    }
++    shortcut_key.values[17] = uint32_t(is_rasterization_done);
++    shortcut_key.values[18] = normalized_depth_control.value;
++    shortcut_key.values[19] = normalized_color_mask;
++    shortcut_possible = GetPath() == Path::kHostRenderTargets && !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable &&
++                        REXCVAR_GET(gpu_rt_update_skip);
++  }
++  if (shortcut_possible && last_full_update_epoch_ == update_epoch_ && shortcut_key == last_full_update_key_) {
++    cp_perf::Add(cp_perf::rt_updates_skipped, 1);
++    return true;
++  }
++  last_full_update_epoch_ = UINT64_MAX;
++
+   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
+                                  normalized_color_mask, vertex_shader)) {
+     return false;
+@@ -1487,6 +1526,11 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+             rt_dst_access_mask, vulkan_rt.current_layout(), rt_new_layout);
+         vulkan_rt.SetUsage(rt_dst_stage_mask, rt_dst_access_mask, rt_new_layout);
+       }
++      // vig8-ps4 (v00.08, gpu_rt_update_skip): the next draw with the same inputs may skip all of this.
++      if (shortcut_possible) {
++        last_full_update_key_ = shortcut_key;
++        last_full_update_epoch_ = update_epoch_;
++      }
+     } break;
+ 
+     case Path::kPixelShaderInterlock: {
+@@ -2072,6 +2116,16 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+   }
+   dfn.vkUpdateDescriptorSets(device, key.is_depth ? 2 : 1, descriptor_set_write, 0, nullptr);
+ 
++  // vig8-ps4: the first host render targets in the log (vig8 v00.01 was killed by the system at its first 4x MSAA
++  // gameplay frame).
++  static std::atomic<uint32_t> render_targets_logged{0};
++  if (render_targets_logged.fetch_add(1, std::memory_order_relaxed) < 64) {
++    REXGPU_INFO("[rt] new {} render target {}x{} {}xMSAA {} (Vulkan format {}), EDRAM base {} pitch {} tiles",
++                key.is_depth ? "depth" : "color", image_create_info.extent.width,
++                image_create_info.extent.height, uint32_t(image_create_info.samples), key.GetFormatName(),
++                int(image_create_info.format), uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp));
++  }
++
+   return new VulkanRenderTarget(key, *this, image, memory, view_depth_color, view_depth_stencil,
+                                 view_stencil, view_srgb, view_color_transfer_separate,
+                                 descriptor_set_index_transfer_source);
+@@ -4551,6 +4605,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+     const std::vector<Transfer>* render_target_transfers,
+     const uint64_t* render_target_resolve_clear_values,
+     const Transfer::Rectangle* resolve_clear_rectangle) {
++  ++update_epoch_;  // vig8-ps4 (v00.08)
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+@@ -6021,6 +6076,7 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
+ 
+ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
+                                                 uint32_t dump_rows, uint32_t dump_pitch) {
++  ++update_epoch_;  // vig8-ps4 (v00.08)
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
+   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..d131363 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -22,6 +22,7 @@
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/flags.h>
++#include <rex/graphics/cp_perf.h>  // vig8-ps4 (v00.09): the sampler memo's counters
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/pipeline/texture/util.h>
+ #include <rex/graphics/vulkan/command_processor.h>
+@@ -440,6 +441,7 @@ VulkanTextureCache::~VulkanTextureCache() {
+   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
+     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
+   }
++  std::fill(std::begin(sampler_mru_), std::end(sampler_mru_), nullptr);  // vig8-ps4 (v00.09)
+   samplers_.clear();
+   custom_border_color_sampler_count_ = 0;
+   COUNT_profile_set("gpu/texture_cache/vulkan/samplers", 0);
+@@ -673,6 +675,35 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
+ 
+ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
+     const VulkanShader::SamplerBinding& binding) const {
++  // vig8-ps4 (v00.09): the memo. The result depends only on the fetch constant's six dwords, the binding's filter
++  // overrides and anisotropic_override (max_anisotropy_ and the host formats' filterability are fixed); a frame asks
++  // for the same few thousand times.
++  const uint32_t* fetch_dwords =
++      &register_file().values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * binding.fetch_constant];
++  const uint32_t binding_key = UINT32_C(0x80000000) | uint32_t(binding.mag_filter) |
++                               (uint32_t(binding.min_filter) << 2) | (uint32_t(binding.mip_filter) << 4) |
++                               (uint32_t(binding.aniso_filter) << 6) |
++                               ((uint32_t(REXCVAR_GET(anisotropic_override) + 1) & 0xF) << 9);
++  uint32_t memo_hash = binding_key * UINT32_C(0x9E3779B1);
++  for (uint32_t i = 0; i < 6; ++i) {
++    memo_hash = (memo_hash ^ fetch_dwords[i]) * UINT32_C(0x85EBCA77);
++  }
++  SamplerParametersMemo& memo =
++      sampler_parameters_memo_[(memo_hash ^ (memo_hash >> 15)) & (kSamplerParametersMemoSize - 1)];
++  cp_perf::Add(cp_perf::sampler_lookups, 1);
++  if (memo.binding_key == binding_key && !std::memcmp(memo.fetch, fetch_dwords, sizeof(memo.fetch))) {
++    cp_perf::Add(cp_perf::sampler_memo_hits, 1);
++    return memo.parameters;
++  }
++  const SamplerParameters parameters = GetSamplerParametersUncached(binding);
++  std::memcpy(memo.fetch, fetch_dwords, sizeof(memo.fetch));
++  memo.binding_key = binding_key;
++  memo.parameters = parameters;
++  return parameters;
++}
++
++VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParametersUncached(
++    const VulkanShader::SamplerBinding& binding) const {
+   const auto& regs = register_file();
+   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
+ 
+@@ -762,10 +793,19 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+   assert_true(command_processor_.submission_open());
+   uint64_t submission_current = command_processor_.GetCurrentSubmission();
+ 
+-  // Try to find an existing sampler.
+-  auto it_existing = samplers_.find(parameters);
+-  if (it_existing != samplers_.end()) {
+-    std::pair<const SamplerParameters, Sampler>& sampler = *it_existing;
++  // Try to find an existing sampler. vig8-ps4 (v00.09): its MRU slot first, then the map (a modulo a lookup).
++  std::pair<const SamplerParameters, Sampler>*& mru_slot =
++      sampler_mru_[(parameters.value * UINT32_C(0x9E3779B1)) >> (32 - kSamplerMruSizeLog2)];
++  std::pair<const SamplerParameters, Sampler>* found_sampler = mru_slot;
++  if (!found_sampler || found_sampler->first != parameters) {
++    auto it_existing = samplers_.find(parameters);
++    found_sampler = it_existing != samplers_.end() ? &*it_existing : nullptr;
++    if (found_sampler) {
++      mru_slot = found_sampler;
++    }
++  }
++  if (found_sampler) {
++    std::pair<const SamplerParameters, Sampler>& sampler = *found_sampler;
+     assert_true(sampler.second.last_usage_submission <= submission_current);
+     // This is called very frequently, don't relink unless needed for caching.
+     if (sampler.second.last_usage_submission < submission_current) {
+@@ -823,6 +863,7 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+     assert_true(it_reuse != samplers_.end());
+     if (it_reuse != samplers_.end()) {
+       // This destroys the Sampler object.
++      std::fill(std::begin(sampler_mru_), std::end(sampler_mru_), nullptr);  // vig8-ps4 (v00.09)
+       samplers_.erase(it_reuse);
+       COUNT_profile_set("gpu/texture_cache/vulkan/samplers", samplers_.size());
+     } else {
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 984b97d..50d04fa 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -50,7 +50,7 @@ set(REXKERNEL_SOURCES
+     xboxkrnl/xboxkrnl_rtl.cpp
+     xboxkrnl/xboxkrnl_strings.cpp
+     xboxkrnl/xboxkrnl_threading.cpp
+-    # xboxkrnl/xboxkrnl_usbcam.cpp  # TODO: lol eventually.
++    xboxkrnl/xboxkrnl_usbcam.cpp  # vig8-ps4: Vigilante 8 Arcade imports the Vision camera API (XUsbcam*)
+     xboxkrnl/xboxkrnl_video.cpp
+     xboxkrnl/xboxkrnl_xconfig.cpp
+     xboxkrnl/xboxkrnl_audio.cpp
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index 5a572ce..acd85e3 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -20,6 +20,9 @@
+ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
+                     "Don't display any UI, using defaults for prompts as needed");
+ #include <rex/kernel/xam/private.h>
++#include <rex/kernel/xam/ui_hooks.h>
++
++#include <atomic>
+ #include <rex/hook.h>
+ #include <rex/types.h>
+ #include <rex/system/xtypes.h>
+@@ -542,6 +545,24 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
+   exit(1);
+ }
+ 
++// vig8-ps4: the title's "Achievements" menu item opens what the app set (rex/kernel/xam/ui_hooks.h).
++namespace {
++std::atomic<void (*)()> g_show_achievements_hook{nullptr};
++}  // namespace
++
++void SetShowAchievementsUiHook(void (*hook)()) { g_show_achievements_hook.store(hook, std::memory_order_release); }
++
++u32 XamShowAchievementsUI_entry(u32 user_index) {
++  (void)user_index;
++  if (auto hook = g_show_achievements_hook.load(std::memory_order_acquire)) hook();
++  return X_ERROR_SUCCESS;
++}
++
++u32 XamShowAchievementsUIEx_entry(u32 user_index, u32 r4) {
++  (void)r4;
++  return XamShowAchievementsUI_entry(user_index);
++}
++
+ u32 XamShowPartyUI_entry(u32 r3, u32 r4) {
+   return X_ERROR_FUNCTION_FAILED;
+ }
+@@ -570,6 +591,8 @@ REX_EXPORT(__imp__XamShowKeyboardUI, rex::kernel::xam::XamShowKeyboardUI_entry)
+ REX_EXPORT(__imp__XamShowDeviceSelectorUI, rex::kernel::xam::XamShowDeviceSelectorUI_entry)
+ REX_EXPORT(__imp__XamShowDirtyDiscErrorUI, rex::kernel::xam::XamShowDirtyDiscErrorUI_entry)
+ REX_EXPORT(__imp__XamShowPartyUI, rex::kernel::xam::XamShowPartyUI_entry)
++REX_EXPORT(__imp__XamShowAchievementsUI, rex::kernel::xam::XamShowAchievementsUI_entry)
++REX_EXPORT(__imp__XamShowAchievementsUIEx, rex::kernel::xam::XamShowAchievementsUIEx_entry)
+ REX_EXPORT(__imp__XamShowCommunitySessionsUI, rex::kernel::xam::XamShowCommunitySessionsUI_entry)
+ REX_EXPORT(__imp__XamShowMessageBoxUIEx, rex::kernel::xam::XamShowMessageBoxUIEx_entry)
+ 
+@@ -583,8 +606,6 @@ REX_EXPORT_STUB(__imp__XamNavigate);
+ REX_EXPORT_STUB(__imp__XamNavigateBack);
+ REX_EXPORT_STUB(__imp__XamOverrideHudOpenType);
+ REX_EXPORT_STUB(__imp__XamShowAchievementDetailsUI);
+-REX_EXPORT_STUB(__imp__XamShowAchievementsUI);
+-REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);
+ REX_EXPORT_STUB(__imp__XamShowAndWaitForMessageBoxEx);
+ REX_EXPORT_STUB(__imp__XamShowAvatarAwardGamesUI);
+ REX_EXPORT_STUB(__imp__XamShowAvatarAwardsUI);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 25db0d6..661dcb5 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -442,6 +442,14 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
+   return 0;
+ }
+ 
++namespace {
++std::atomic<void (*)()> g_guest_swap_hook{nullptr};
++}  // namespace
++
++void SetGuestSwapHook(void (*hook)()) {
++  g_guest_swap_hook.store(hook, std::memory_order_release);
++}
++
+ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+                   mapped_void fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
+                   mapped_void unk2,            // system writeback ptr
+@@ -450,6 +458,9 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
+                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
+                   mapped_u32 height) {
++  if (auto hook = g_guest_swap_hook.load(std::memory_order_acquire)) {
++    hook();  // vig8-ps4: the app's frame counter
++  }
+   // All of these parameters are REQUIRED.
+   assert(buffer_ptr);
+   assert(fetch_ptr);
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index 78826a6..7cf6b7b 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -49,10 +49,28 @@ REXCVAR_DEFINE_STRING(content_backup_root, "", "Kernel",
+                       "Carpeta donde dejar una copia de cada guardado, con una subcarpeta por perfil. "
+                       "Vacia = no se copia nada");
+ 
++// vig8-ps4 (as the MGR port's v00.12): installed marketplace content (DLC) read from its own folder, in the content
++// layout (<xuid>/<title>/00000002/<package>/ and <xuid>/<title>/Headers/00000002/<package>.header): on the PS4 the
++// package itself holds it (/app0/content, read-only), while saves stay in the writable content root.
++REXCVAR_DEFINE_STRING(content_marketplace_root, "", "Kernel",
++                      "Folder holding installed marketplace content (DLC) in the content layout. Empty: the content "
++                      "root");
++
+ namespace rex {
+ namespace system {
+ namespace xam {
+ 
++namespace {
++// The root a content type's packages and headers live under: content_marketplace_root for DLC when it is set.
++std::filesystem::path ContentRootFor(const std::filesystem::path& root, XContentType content_type) {
++  if (content_type == XContentType::kMarketplaceContent) {
++    const std::string marketplace = REXCVAR_GET(content_marketplace_root);
++    if (!marketplace.empty()) return rex::to_path(marketplace);
++  }
++  return root;
++}
++}  // namespace
++
+ static const char* kThumbnailFileName = "__thumbnail.png";
+ 
+ static const char* kGameUserContentDirName = "profile";
+@@ -254,7 +272,7 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
+ 
+   // Package root path:
+   // content_root/xuid/title_id/content_type/
+-  return root_path_ / xuid_str / title_id_str / content_type_str;
++  return ContentRootFor(root_path_, content_type) / xuid_str / title_id_str / content_type_str;
+ }
+ 
+ std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
+@@ -290,8 +308,8 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
+ 
+   // Header root path:
+   // content_root/xuid/title_id/Headers/content_type/filename.header
+-  return root_path_ / xuid_str / title_id_str / kGameContentHeaderDirName / content_type_str /
+-         final_name;
++  return ContentRootFor(root_path_, content_type) / xuid_str / title_id_str / kGameContentHeaderDirName /
++         content_type_str / final_name;
+ }
+ 
+ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
+@@ -314,8 +332,10 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+     }
+ 
+     XCONTENT_AGGREGATE_DATA content_data;
+-    if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
+-                                         content_type, content_data))) {
++    // vig8-ps4 (the MGR port's v00.14 fix): ReadContentHeaderFile returns a Win32 X_RESULT, and XSUCCEEDED (an NTSTATUS
++    // test) let X_ERROR_FILE_NOT_FOUND (2) through, so a package without a .header was listed uninitialized.
++    if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
++                              content_data) == X_ERROR_SUCCESS) {
+       result.emplace_back(std::move(content_data));
+     } else {
+       content_data.device_id = device_id;
+diff --git a/src/system/xex_module.cpp b/src/system/xex_module.cpp
+index 0726516..e4a81f0 100644
+--- a/src/system/xex_module.cpp
++++ b/src/system/xex_module.cpp
+@@ -460,7 +460,10 @@ int XexModule::ReadImage(const void* xex_addr, size_t xex_length, bool use_dev_k
+     return 0;
+   }
+ 
+-  memory()->LookupHeap(base_address_)->Reset();
++  // vig8-ps4 (from sp00nznet/rexglue-sdk b2983ca): no Reset() of the image's heap. A static recompilation loads one
++  // module, so there is nothing stale to clear, and Reset() drops the page table of the whole 0x8xxxxxxx heap,
++  // including the function dispatcher's allocation at the image's end.
++  // memory()->LookupHeap(base_address_)->Reset();
+ 
+   aes_decrypt_buffer(use_dev_key ? xe_xex2_devkit_key : xe_xex2_retail_key,
+                      reinterpret_cast<const uint8_t*>(xex_security_info()->aes_key), 16,
