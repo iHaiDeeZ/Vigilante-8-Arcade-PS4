@@ -134,10 +134,10 @@ index 0000000..facb983
 +REX_DEFINE_APP(vig8, Vig8App::Create)
 diff --git a/project/ps4/vig8_ps4.cpp b/project/ps4/vig8_ps4.cpp
 new file mode 100644
-index 0000000..9bd5180
+index 0000000..9b49923
 --- /dev/null
 +++ b/project/ps4/vig8_ps4.cpp
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,247 @@
 +// vig8-ps4 - Vigilante 8 Arcade on the PS4: the port's settings for ps4-kit's runtime and the SDK, and its
 +// diagnostics.
 +//
@@ -172,9 +172,20 @@ index 0000000..9bd5180
 +
 +PS4_DIAG_DATA_DIR("/data/V8A");
 +
++// v00.11: the main heap from direct memory. By default it took 256 MiB of the system flexible pool (391 MiB here),
++// which the kernel's pthread objects (every std::mutex and condition variable: each guest event, semaphore and
++// thread has some), the system libc heap and Sony's modules share. v00.10 ran out of it 20 minutes into a race:
++// a new event's mutex could not get its kernel object ("mutex lock failed: Out of memory", XamUserWriteProfileSettings
++// completing). Direct memory has room (3.4 GB free after the guest arena); the heap's overflow already went there.
 +extern "C" void ps4_kit_configure_heap(ps4_kit_heap_options* options) {
 +  options->log_tag = "vig8";
++  options->source_order = PS4_KIT_HEAP_DIRECT_FIRST;
 +}
++
++// libkernel: the flexible memory still free (the kit's start line "heap: flexible memory available").
++extern "C" int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
++// The SDK (system/xobject.cpp, v00.11): live guest objects by type.
++extern "C" uint32_t rex_xobject_live_counts(uint32_t* out, uint32_t count);
 +
 +REXCVAR_DEFINE_STRING(vig8_game, "", "Vig8",
 +                      "Game folder (the unpacked XBLA package: default.xex, data/ ...). Empty: game/ in the package, "
@@ -202,6 +213,9 @@ index 0000000..9bd5180
 +                    "Diagnostic: when the game shows no new frame for 15 s, the stacks of every thread to "
 +                    "/data/V8A/hang.log (again 30 s later)");
 +REXCVAR_DEFINE_BOOL(vig8_frame_log, true, "Vig8", "A line in the log every 10 s with the game's frames per second");
++REXCVAR_DEFINE_BOOL(vig8_memory_log, true, "Vig8",
++                    "Diagnostic: a [memory] line in the log every 10 s - the free flexible memory (the pool the "
++                    "kernel's pthread objects come from), the heap, and the live guest objects by type");
 +REXCVAR_DEFINE_STRING(vig8_radv_debug, "", "Vig8",
 +                      "RADV_DEBUG for the GPU driver (RADV's comma-separated debug options; empty: none). v00.02 "
 +                      "ran with nofmask,nohiz,nofastclears and the system killed it at the same point as v00.01 (a "
@@ -255,6 +269,25 @@ index 0000000..9bd5180
 +// When the game has shown no new frame for 15 s (after at least 60): every thread's stack (ps4-kit's thread dump: host
 +// return addresses relative to .text, for llvm-symbolizer --obj=<the build's ELF in ~/vig8-build/oelf>; recompiled
 +// guest functions are named sub_XXXXXXXX there) to /data/V8A/hang.log, and once more 30 s later. MP3's freeze report.
++// v00.11: every 10 s (from the freeze watch's thread), what v00.10's "Out of memory" crash would have shown coming:
++// the free flexible memory and its change since the start, the heap, the live guest objects by type.
++void LogMemory() {
++  static size_t first_free = 0;
++  size_t free_bytes = 0;
++  sceKernelAvailableFlexibleMemorySize(&free_bytes);
++  if (!first_free) first_free = free_bytes;
++  char heap[192] = {};
++  ps4rt_heap_report(heap, sizeof(heap));
++  uint32_t live[16] = {};
++  const uint32_t total = rex_xobject_live_counts(live, 16);
++  // XObject::Type: 2 event, 3 file, 4 I/O completion, 6 mutant, 7 notify listener, 8 semaphore, 12 thread, 13 timer.
++  const uint32_t other = total - live[2] - live[3] - live[6] - live[7] - live[8] - live[12] - live[13];
++  REXLOG_INFO("[memory] flexible memory free {:.1f} MiB ({:+.1f} MiB since the start); {}; guest objects {}: events "
++              "{}, semaphores {}, mutants {}, timers {}, threads {}, files {}, notify listeners {}, other {}",
++              double(free_bytes) / 1048576.0, (double(free_bytes) - double(first_free)) / 1048576.0, heap, total,
++              live[2], live[8], live[6], live[13], live[12], live[3], live[7], other);
++}
++
 +void StartFreezeReport() {
 +  std::thread([] {
 +    ps4_watch_thread("vig8 freeze watch");
@@ -262,8 +295,13 @@ index 0000000..9bd5180
 +    uint32_t last = g_swaps.load(std::memory_order_acquire);
 +    auto last_change = std::chrono::steady_clock::now();
 +    int dumps = 0;
++    int memory_ticks = 0;
 +    for (;;) {
 +      std::this_thread::sleep_for(std::chrono::seconds(1));
++      if (++memory_ticks >= 10) {
++        memory_ticks = 0;
++        if (REXCVAR_GET(vig8_memory_log)) LogMemory();
++      }
 +      const uint32_t now_count = g_swaps.load(std::memory_order_acquire);
 +      const auto now = std::chrono::steady_clock::now();
 +      const double stalled = std::chrono::duration<double>(now - last_change).count();
@@ -724,10 +762,10 @@ index 0000000..83d3fe4
 +}
 diff --git a/project/ps4/vig8_ps4_menu.cpp b/project/ps4/vig8_ps4_menu.cpp
 new file mode 100644
-index 0000000..6c18402
+index 0000000..d345268
 --- /dev/null
 +++ b/project/ps4/vig8_ps4_menu.cpp
-@@ -0,0 +1,1323 @@
+@@ -0,0 +1,1334 @@
 +// vig8-ps4 - the L3+R3 quick menu and the frame counter (v00.05): settings to toggle while playing, a frame counter
 +// and so on.
 +//
@@ -1312,6 +1350,17 @@ index 0000000..6c18402
 +        frames.set = [](int v) { SetCvar("vig8_frame_log", v ? "true" : "false"); };
 +        frames.help = "A line in the log every 10 s with the game's frames a second.";
 +        rows.push_back(std::move(frames));
++
++        // v00.11: vig8_memory_log (vig8_ps4.cpp), live.
++        Row memory;
++        memory.kind = Row::Kind::kSwitch;
++        memory.label = "Memory log";
++        memory.get = [] { return rex::cvar::Query<bool>("vig8_memory_log") ? 1 : 0; };
++        memory.set = [](int v) { SetCvar("vig8_memory_log", v ? "true" : "false"); };
++        memory.help =
++            "A line in the log every 10 s with the free system memory and the game's live objects: what to send if "
++            "the game ends with an out-of-memory error.";
++        rows.push_back(std::move(memory));
 +
 +        Row waits;
 +        waits.kind = Row::Kind::kSwitch;

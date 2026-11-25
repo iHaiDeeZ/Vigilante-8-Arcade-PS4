@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v00.10-ff8a3d">
+  <a href="https://github.com/iHaiDeeZ/Vigilante-8-Arcade-PS4/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/iHaiDeeZ/Vigilante-8-Arcade-PS4?label=release&color=ff8a3d"></a>
   <img alt="PS4 homebrew" src="https://img.shields.io/badge/PS4-homebrew-1f5fd6">
   <img alt="Xbox 360 recomp" src="https://img.shields.io/badge/Xbox%20360-static%20recomp-107c10">
   <img alt="Vulkan on Mesa RADV" src="https://img.shields.io/badge/Vulkan-Mesa%20RADV-d64545">
@@ -59,22 +59,24 @@ The package you build holds your game, so it's for your own console only.
   are spread over the other six by how busy each one is.
 - **One pass for the 3D scene (v00.10).** The original draws its scene with 4x MSAA, which doesn't fit the Xbox 360's
   10 MB of video memory at 720p, so it draws the whole scene four times, once per quarter of the screen. Here the
-  scene is drawn once, with FXAA to smooth the edges. The original 4x MSAA is one menu setting away.
+  scene is drawn once, with FXAA to smooth the edges: races went from 25-50 fps to about 60. The original 4x MSAA
+  is one menu setting away.
 - Frames flip as soon as they're ready instead of waiting for the next 60 Hz tick, with the game's clock untouched.
 - Shortcuts for the work the GPU layer repeats on every draw (render targets, shader loads, samplers).
 
 **When something goes wrong**
 - A log for every session, ps4-kit's boot trace and crash log in `/data/V8A/`.
 - Diagnostics you can switch off in the menu: a freeze report with every thread's stack, a log of the game's long
-  waits, CPU profiles (one starts by itself on the first slow stretch of a session), and the GPU driver's flight
-  recorder for GPU crashes.
+  waits, a memory log, CPU profiles (one starts by itself on the first slow stretch of a session), and the GPU
+  driver's flight recorder for GPU crashes.
 
 ## Status
 
 | | |
 |---|---|
 | Boots, menus, races | yes |
-| Frame rate | menus 60. Races on a PS4 Pro in Boost Mode: 25 to 50 fps (v00.09), 15 to 25 in Farmland's busiest views (v00.08). v00.10 draws the scene once instead of four times: **not measured on a console yet** |
+| Frame rate | menus 60. Races on a PS4 Pro in Boost Mode: about 60 fps since v00.10 (a 20-minute test: mostly 58-60, lowest 47); before it, 25 to 50, and 15 to 25 in Farmland's busiest views |
+| Long sessions | v00.10 ended after 20 minutes with an out-of-memory error; v00.11 gives that memory three times the room: **not confirmed on a console yet** |
 | Roads and bridges (tessellated) | yes, since v00.05 |
 | High Octane Pack | yes, in the package |
 | Achievements | yes, in the quick menu |
@@ -128,13 +130,13 @@ configuration is made for that file.
    ```bash
    scripts/build-vig8.sh host
    scripts/build-vig8.sh codegen
-   VIG8_VERSION=00.10 scripts/build-vig8.sh app
-   VIG8_VERSION=00.10 scripts/build-vig8.sh pkg
+   VIG8_VERSION=00.11 scripts/build-vig8.sh app
+   VIG8_VERSION=00.11 scripts/build-vig8.sh pkg
    ```
 
    `host` builds the code generator, `codegen` writes the game's C++ from your `default.xex` (and applies the speed
    passes and the game fixes), `app` compiles the eboot (about 1.5 GB of RAM per compile job) and `pkg` makes
-   **`out/V8A-v00.10.pkg`** (title ID `VIGA00001`, about 225 MB with your game and DLC inside).
+   **`out/V8A-v00.11.pkg`** (title ID `VIGA00001`, about 225 MB with your game and DLC inside).
 
 5. Copy the package to the console (FTP to `/data/pkg`) and install it with GoldHEN's **Package Installer**.
 
@@ -180,6 +182,7 @@ behind the menu, with your pad held back from it: pause with **OPTIONS** first.
 | | Profile slow gameplay | **On**: once a session, after 15 s in a row under 25 fps, an 8 s profile and a GPU census |
 | | Freeze report | **On**: every thread's stack to `hang.log` when no frame comes for 15 s |
 | | Frame rate log | **On**: the frame rate in the log every 10 s |
+| | Memory log | **On**: the free system memory and the game's live objects in the log every 10 s |
 | | Long-wait log | **On**: every 30 s, the game threads that have waited 2 s or more |
 | | GPU fault recorder | **Off**, On: the GPU driver keeps the last frames' commands, for a GPU crash report (slower; next start) |
 | ACHIEVEMENTS | Unlocked, Unlock pop-ups, the list | your achievements; pop-ups **On** |
@@ -210,9 +213,15 @@ repository is source only.
 The Xbox Live Arcade release with the `default.xex` named above, with or without the High Octane Pack.
 
 **Why does it slow down in busy places?**
-The Xbox 360's GPU commands are translated for Vulkan on one CPU core, one draw at a time, and the busiest views send
-thousands of draws a frame. Before v00.10 every draw of the 3D scene was translated four times (see the overview). On
-a PS4 Pro, turn on **Boost Mode** (Settings > System) for a 2.13 GHz CPU instead of 1.6.
+The Xbox 360's GPU commands are translated for Vulkan on one CPU core, one draw at a time, so the frame rate follows
+the number of draws. Before v00.10 every draw of the 3D scene was translated four times (see the overview), and
+busy views dropped to 15-25 fps; since then races hold about 60. On a PS4 Pro, turn on **Boost Mode** (Settings >
+System) for a 2.13 GHz CPU instead of 1.6.
+
+**The game ended with an out-of-memory error.**
+That was v00.10, after about 20 minutes: the system's memory pool for locks and threads, which the app's main heap
+shared, ran out. v00.11 moves the heap out of it. If it still happens, send the log: its `[memory]` lines show what
+grew.
 
 **The edges look smoother on the Xbox 360.**
 The original uses 4x MSAA, which costs the PS4 four times the work. Pick *4x MSAA* under *Anti-aliasing* in the quick
@@ -253,7 +262,7 @@ Bugs found on the way that matter for other ports of this SDK (the whole story i
 
 ## Good to know
 
-- v00.10's single-pass scene hasn't been measured on a console yet (see [Status](#status)).
+- v00.11's memory change hasn't been confirmed on a console yet (see [Status](#status)).
 - The game keeps running while the quick menu is open.
 - Save in the game; there are no save states. Your saves carry over to new versions.
 - On a PS4 Pro, use Boost Mode. The app can't switch on the Pro's own mode (the Mesa driver knows only the base GPU),

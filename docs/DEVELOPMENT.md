@@ -64,6 +64,7 @@ them.
   few frames), `gpu_commands_core_cycle` (a test: the command processor moves to the next listed core after each
   stats line).
 - `rex_gpu_set_swap_post_effect`: the FXAA setting, live.
+- `rex_xobject_live_counts`: the live guest objects by type, for the app's `[memory]` line.
 
 ## Fixes to the game's code (`project/tools/patch_game_fixes.py`)
 
@@ -125,6 +126,13 @@ smooths the edges; `vig8_antialiasing = 2` is the original.
 - **v00.09**: more per-draw work cut, measurements. The command processor on core 6 or core 2 (the game thread's CPU
   module) made no difference. The game makes no occlusion or VIZ queries.
 - **v00.10**: the predicated tiling found (above); the scene drawn once (`vig8_antialiasing`, FXAA by default).
+  Races held about 60 fps for 20 minutes (500-700 draws a frame instead of 2,000-3,000), then the game ended with
+  an uncaught `std::system_error: mutex lock failed: Out of memory`: completing a `XamUserWriteProfileSettings`,
+  the SDK set the game's event, and the event's `std::mutex` could not get its kernel object. On the PS4, libkernel
+  creates a mutex's or condition variable's kernel object at its first use, from the system flexible pool (391 MiB
+  here), which ps4-kit's main heap (256 MiB by default), the system libc heap and Sony's modules share.
+- **v00.11**: ps4-kit's main heap from direct memory (`PS4_KIT_HEAP_DIRECT_FIRST` in `ps4_kit_configure_heap`), so
+  the whole system pool is left to those; a `[memory]` line every 10 s (below).
 
 Performance is set by the draw count: every Xbox 360 draw is translated to Vulkan on one CPU core (the seventh,
 alone), at about 7-9 us each in v00.09, and the game's own thread needs a few microseconds a draw too. On a PS4 Pro,
@@ -133,15 +141,18 @@ Boost Mode (2.13 GHz) is assumed.
 ## Reading a session
 
 - `/data/V8A/logs/vig8_NNN.log`: `[frames]` every 10 s; the command processor's `[cp]` (draws, resolves and
-  submissions a frame), `[cpt]`/`[cpt2]`/`[cpt3]` (where its time goes), `[wait]`, `[cp2]`.
+  submissions a frame), `[cpt]`/`[cpt2]`/`[cpt3]` (where its time goes), `[wait]`, `[cp2]`; `[memory]` (since
+  v00.11): the free flexible memory and its change since the start, ps4-kit's heap, and the live guest objects by
+  type (the SDK's `rex_xobject_live_counts`, counted in `XObject`'s constructors and destructor).
 - `/data/V8A/profiles/profile_N.txt`: ps4-kit's CPU profiles (addresses relative to `.text`). Name them with
   `python3 ~/ps4-kit/scripts/profile.py --top 3000 --elf ~/vig8-build/oelf/vXX.YY.elf profile_N.txt`, then sum a
   thread by function with `python3 -I scripts/agg_profile.py profile_N.named.txt "GPU Commands"` (self time: the
   converted code has no frame pointers, so inclusive times are unreliable). The numbers restart each session: check
   the profile's module range against the ELF.
 - `/data/V8A/profiles/census_N.txt`: the GPU census, by draw and resolve kind.
-- `/data/V8A/crash.log`: the real fault of a crash (addresses relative to `.text` = eboot address - 0x400000, for
-  `llvm-symbolizer`). The kernel log shows only the later SIGSYS. The SDK's log names the guest address of an
+- `/data/V8A/crash.log`: every crash, the newest last, with the real fault (its "elf" addresses are the eboot address - 0x400000, which
+  `llvm-symbolizer --obj=~/vig8-build/oelf/vXX.YY.elf` takes as they are: the ELF is linked at 0; use the ELF of
+  the version that crashed). The kernel log shows only the later SIGSYS. The SDK's log names the guest address of an
   "Unhandled guest access violation".
 - A GPU fault ends the app without a crash log: capture GoldHEN's kernel log (TCP 3232) live during the test, and
   switch on the GPU fault recorder (`/data/Crema/gpu/flight`).
